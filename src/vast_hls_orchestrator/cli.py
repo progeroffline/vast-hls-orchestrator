@@ -32,7 +32,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image",
-        default=os.getenv("VAST_IMAGE", "nvidia/cuda:12.6.3-runtime-ubuntu24.04"),
+        default=os.getenv("VAST_IMAGE", "progeroffline/vast-transcoder:1.1"),
+        help=(
+            "Docker image for the Vast instance. Default is the project's own "
+            "prebuilt worker image (CUDA 12.6 + custom ffmpeg with NVENC/NVDEC/"
+            "scale_cuda, aria2c -- see https://hub.docker.com/r/progeroffline/"
+            "vast-transcoder), matching the 'HLS Transcoder' Vast template. "
+            "Skips installing ffmpeg/aria2 at boot; rsync is still installed "
+            "by onstart since it's not baked into the image."
+        ),
     )
     parser.add_argument("--disk-gb", type=int, default=40)
     parser.add_argument(

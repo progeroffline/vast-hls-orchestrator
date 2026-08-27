@@ -38,3 +38,11 @@ DEFAULT_GPUS = [
 ]
 
 RENDITIONS = ["1080p", "720p", "480p", "360p"]
+
+# Docker flag-format string, not a JSON object -- that's what PUT /asks/<id>/
+# actually expects for `env` (see docs.vast.ai/api-reference/instances/create-instance).
+# "all" here matches the exact value validated on real GPU hardware via the
+# "HLS Transcoder" Vast template this image ships with (see README); the
+# image's own Dockerfile ENV only sets NVIDIA_DRIVER_CAPABILITIES=compute,utility,
+# which is missing the "video" capability NVENC/NVDEC need.
+INSTANCE_ENV = "-e NVIDIA_DRIVER_CAPABILITIES=all -e NVIDIA_VISIBLE_DEVICES=all"

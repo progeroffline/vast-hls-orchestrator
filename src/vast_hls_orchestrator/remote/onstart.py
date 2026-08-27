@@ -51,8 +51,12 @@ trap bootstrap_failed EXIT
 nohup bash -lc 'sleep {int(failsafe_seconds)}; if [ -z "${{CONTAINER_API_KEY:-}}" ] || [ -z "${{CONTAINER_ID:-}}" ]; then echo "Vast watchdog credentials are unavailable"; exit 1; fi; while true; do if command -v curl >/dev/null && curl -fsS --retry 5 --retry-all-errors -X DELETE -H "Authorization: Bearer $CONTAINER_API_KEY" "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/"; then exit 0; fi; sleep 60; done' > /workspace/watchdog.log 2>&1 &
 
 echo "=== Bootstrap started $(date -u +%FT%TZ) ==="
+# ffmpeg (custom NVENC/NVDEC/scale_cuda build), aria2, curl and
+# ca-certificates are already baked into the vast-transcoder image; only
+# rsync is missing (needed on this side too -- the origin's `rsync pull`
+# spawns `rsync --server` over the same ssh connection on the remote end).
 apt-get update -qq
-apt-get install -y --no-install-recommends ffmpeg aria2 curl ca-certificates rsync
+apt-get install -y --no-install-recommends rsync
 printf '%s' {payload!r} | base64 -d > /workspace/encode-job.sh
 chmod 700 /workspace/encode-job.sh
 echo "=== Starting encode job ==="

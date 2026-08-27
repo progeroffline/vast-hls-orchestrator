@@ -309,13 +309,23 @@ Offers сортируются лексикографически по следу
 Лучший доступный offer принимается запросом `PUT /api/v0/asks/<offer_id>/`. Параметры instance:
 
 ```text
-image:        nvidia/cuda:12.6.3-runtime-ubuntu24.04
+image:        progeroffline/vast-transcoder:1.1
 disk:         40 GB
 runtype:      ssh_direct
 target_state: running
 cancel_unavail: true
-NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+env:          -e NVIDIA_DRIVER_CAPABILITIES=all -e NVIDIA_VISIBLE_DEVICES=all
 ```
+
+`env` — docker flag-format строка (`-e KEY=value ...`), как того требует сам `/asks/` endpoint, а не JSON-объект `{key: value}` (это была реальная ошибка в более раннем коде: значение уходило в API как объект и не применялось так, как задумано). `all` для `NVIDIA_DRIVER_CAPABILITIES` — то же самое значение, что и в собственном Vast-шаблоне образа ("HLS Transcoder"), провалидированное там на реальном железе: Dockerfile образа сам по себе задаёт лишь `compute,utility`, без `video`, необходимого для NVENC/NVDEC.
+
+### Docker image: `progeroffline/vast-transcoder`
+
+По умолчанию (`--image`, переопределяется через `VAST_IMAGE`) используется собственный образ проекта — [`progeroffline/vast-transcoder`](https://hub.docker.com/r/progeroffline/vast-transcoder), тот же, что зарегистрирован в приватном Vast-шаблоне ["HLS Transcoder"](https://cloud.vast.ai/?template_id=adf45ab182295032e068198e37c4788e) (`hash_id=adf45ab182295032e068198e37c4788e`, получен через `GET /api/v0/template/?select_filters={"hash_id":{"eq":...}}`). База — `nvidia/cuda:12.6.3` Ubuntu 24.04, поверх неё собран свой `ffmpeg` (в `/opt/ffmpeg/bin`, уже в `PATH` образа) с `h264_nvenc`/`hevc_nvenc`/`av1_nvenc`, `cuvid`-декодерами и `scale_cuda`, плюс `aria2c`, `curl`, `ca-certificates`. Поэтому `onstart` (см. [Bootstrap и remote job](#bootstrap-и-remote-job)) больше не ставит `ffmpeg`/`aria2`/`curl`/`ca-certificates` через `apt-get` — только `rsync`, которого в образе нет (он нужен и на remote-стороне: `rsync pull` с origin поднимает `rsync --server` через тот же SSH-канал на удалённом конце).
+
+Образ не заменяет и не отменяет запись SSH-ключа через `onstart` (см. ниже) — свой `authorized_keys` он не пишет и не знает публичного ключа заранее, эта часть архитектуры не изменилась.
+
+**Известное ограничение образа**: `ENTRYPOINT`/`CMD` образа (`tini -- /usr/local/bin/start.sh`) сам по себе делает GPU/NVENC/NVDEC/`scale_cuda` preflight и затем `exec sleep infinity`, чтобы удержать контейнер живым; это отдельный процесс, параллельный orchestrator'овскому `onstart` (Vast выполняет `onstart` через отдельный exec, а не вместо image `CMD`) и на сам `onstart`/job не влияет. Но если preflight внутри `start.sh` сам завершится с ошибкой (`exit 10/11/12` — до `exec sleep infinity`), это может уронить весь контейнер как PID 1 под `tini`, ещё до того, как `onstart` вообще успеет отработать — тогда SSH не поднимется не из-за проблемы с ключом, а потому что контейнера уже нет, и SSH-recovery (reboot + retry, см. ниже) будет упираться в тот же самый preflight по кругу. На практике это тот же набор GPU-проверок, что и в собственном preflight `job_script.py` (см. [Проверка GPU и диска](#проверка-gpu-и-диска)) — то есть на офере, прошедшем поиск/фильтры, до этого дело обычно не доходит, но если это когда-то случится систематически, это повод поправить `start.sh` в самом образе (например, не завершаться с ошибкой, а тоже уходить в `sleep infinity`), а не что-то, что можно обойти со стороны orchestrator.
 
 Также передаются уникальный label и `onstart` script. Label используется не только для удобства: если TCP-соединение оборвалось после PUT и неизвестно, создал ли Vast instance, orchestrator ищет instance через `GET /api/v1/instances` с точным label. До завершения reconciliation новый offer не арендуется — это защищает от «потерянного» платного instance.
 
@@ -364,7 +374,7 @@ Bootstrap:
 3. перенаправляет stdout/stderr через `tee` в `/workspace/bootstrap.log`;
 4. запускает self-destroy watchdog;
 5. выполняет `apt-get update`;
-6. устанавливает `ffmpeg`, `aria2`, `curl`, `ca-certificates`, `rsync`;
+6. устанавливает `rsync` (единственный отсутствующий в образе бинарь — `ffmpeg`, `aria2c`, `curl`, `ca-certificates` уже в `progeroffline/vast-transcoder`, см. [Docker image](#docker-image-progeroffline-vast-transcoder));
 7. декодирует `/workspace/encode-job.sh` из Base64;
 8. запускает job через `nohup`, вывод направляет в `/workspace/job.log`.
 
@@ -619,7 +629,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--origin-root` | `/var/www/html/video` | Корень публикации |
 | `--ssh-key` | **обязателен** | Локальный private key для Vast SSH; публичная часть должна быть заранее добавлена в тот же аккаунт Vast.ai, чей `VAST_API_KEY` используется |
 | `--known-hosts` | `/root/.ssh/vast_known_hosts` | Базовое имя ephemeral known-hosts file |
-| `--image` | CUDA 12.6.3 Ubuntu 24.04 | Vast Docker image |
+| `--image` | `progeroffline/vast-transcoder:1.1` | Vast Docker image (переопределяется через `VAST_IMAGE`) |
 | `--disk-gb` | `40` | Размер instance disk |
 | `--max-hourly` | `0.80` | Максимальная цена offer |
 | `--min-reliability` | `0.98` | Минимальная reliability |

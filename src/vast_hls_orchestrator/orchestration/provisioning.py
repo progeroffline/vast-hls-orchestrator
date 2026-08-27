@@ -11,7 +11,7 @@ from loguru import logger
 from rich.markup import escape
 
 from ..core.console import console
-from ..core.constants import BAD_STATES
+from ..core.constants import BAD_STATES, INSTANCE_ENV
 from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, VastError
 from ..remote.ssh import wait_for_ssh
 from ..vast_api.client import VastClient
@@ -167,7 +167,7 @@ def rent_instance(
             "label": create_label,
             "runtype": "ssh_direct",
             "target_state": "running",
-            "env": {"NVIDIA_DRIVER_CAPABILITIES": "compute,video,utility"},
+            "env": INSTANCE_ENV,
             "onstart": onstart,
             "cancel_unavail": True,
             "python_utf8": True,
