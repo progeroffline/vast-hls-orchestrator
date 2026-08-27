@@ -9,8 +9,14 @@ from loguru import logger
 from rich.table import Table
 
 from ..core.console import console
+from ..core.constants import GPU_NVENC_SESSIONS
 from ..core.errors import VastAuthError, VastError
 from .client import VastClient
+
+
+def gpu_nvenc_sessions(gpu_name: str) -> int:
+    """How many concurrent NVENC sessions this GPU model has (1 if unknown)."""
+    return GPU_NVENC_SESSIONS.get((gpu_name or "").strip(), 1)
 
 
 def source_size_bytes(url: str) -> int | None:
@@ -64,6 +70,13 @@ def choose_offers(
     offers = list(dedup.values())
     offers.sort(
         key=lambda o: (
+            # More NVENC engines first: the ABR pipeline's 4 parallel encode
+            # branches get real hardware parallelism instead of time-slicing
+            # a single engine (see core.constants.GPU_NVENC_SESSIONS). Cost
+            # is only a tiebreaker within the same NVENC tier, not the
+            # primary ranking -- "best offer" here means best for this job,
+            # not just cheapest.
+            -gpu_nvenc_sessions(o.get("gpu_name", "")),
             offer_estimated_cost(o, input_gb, args.expected_hours),
             float(o.get("dph_total") or 999),
             -float(o.get("inet_down") or 0),
@@ -83,6 +96,7 @@ def choose_offers(
     )
     table.add_column("Offer", justify="right")
     table.add_column("GPU")
+    table.add_column("NVENC", justify="right")
     table.add_column("$/h", justify="right")
     table.add_column("Reliability", justify="right")
     table.add_column("Down Mbps", justify="right")
@@ -92,9 +106,11 @@ def choose_offers(
 
     for offer in offers[:5]:
         est = offer_estimated_cost(offer, input_gb, args.expected_hours)
+        gpu_name = str(offer.get("gpu_name", "-"))
         table.add_row(
             str(offer.get("id", "-")),
-            str(offer.get("gpu_name", "-")),
+            gpu_name,
+            str(gpu_nvenc_sessions(gpu_name)),
             f"{float(offer.get('dph_total') or 0):.4f}",
             f"{float(offer.get('reliability') or 0):.4f}",
             f"{float(offer.get('inet_down') or 0):.0f}",

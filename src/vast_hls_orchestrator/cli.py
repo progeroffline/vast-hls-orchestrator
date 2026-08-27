@@ -35,7 +35,16 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("VAST_IMAGE", "nvidia/cuda:12.6.3-runtime-ubuntu24.04"),
     )
     parser.add_argument("--disk-gb", type=int, default=40)
-    parser.add_argument("--max-hourly", type=float, default=0.08)
+    parser.add_argument(
+        "--max-hourly",
+        type=float,
+        default=0.80,
+        help=(
+            "Price ceiling; the default GPU allow-list includes cards like "
+            "RTX 4090/5090 and L40S/L4 that cost more per hour than a bare "
+            "RTX 3060, so this is higher than a budget-only ceiling would be"
+        ),
+    )
     parser.add_argument("--min-reliability", type=float, default=0.98)
     parser.add_argument("--min-cpu", type=int, default=4)
     parser.add_argument("--min-ram-mb", type=int, default=8192)
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         "--monitor-interval",
         type=float,
         default=1.5,
-        help="Seconds between Rich dashboard refresh queries",
+        help="Seconds between SSH telemetry polls during encoding",
     )
     parser.add_argument(
         "--ssh-reconnect-timeout",
