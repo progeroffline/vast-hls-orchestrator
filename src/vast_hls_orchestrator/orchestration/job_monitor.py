@@ -25,7 +25,14 @@ def _log_progress(ctx: JobContext, snap: RemoteSnapshot) -> None:
     elapsed = max(0.0, time.time() - ctx.started_at)
     parts = [f"stage={snap.stage}"]
     if ctx.expected_input_bytes:
-        pct = snap.downloaded_bytes * 100.0 / ctx.expected_input_bytes
+        # downloaded_bytes is real disk blocks allocated (stat %b -- see
+        # remote/snapshot.py), expected_input_bytes is the source URL's
+        # logical Content-Length: different units that can legitimately
+        # diverge by a few percent (filesystem block-alignment overhead
+        # across aria2's 16 parallel segments), so this can exceed 100%
+        # without anything actually being wrong. Clamp only the displayed
+        # percentage; the raw byte counts alongside it stay honest.
+        pct = min(100.0, snap.downloaded_bytes * 100.0 / ctx.expected_input_bytes)
         parts.append(
             f"download={pct:4.1f}% ({format_bytes(snap.downloaded_bytes)}/{format_bytes(ctx.expected_input_bytes)})"
         )
