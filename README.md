@@ -37,7 +37,7 @@ Binary Racks origin
 Temporary Vast.ai NVIDIA instance
   │
   │  2. aria2 загружает публичный source MP4 с origin
-  │  3. NVDEC → scale_cuda → NVENC создаёт 4 HLS rendition
+  │  3. один NVDEC decode → GPU split → 4× scale_cuda → 4× NVENC → 4 HLS rendition
   │
   ▲  4. Origin сам подключается по SSH и делает rsync pull
   │
@@ -108,7 +108,7 @@ src/vast_hls_orchestrator/
 7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint.
 8. Vast выполняет переданный `onstart`: запускает watchdog, устанавливает пакеты и стартует remote encode job.
 9. Origin через SSH опрашивает stage, download size, GPU telemetry, progress-файлы и tails логов.
-10. Remote job скачивает source, проверяет диск и GPU pipeline, затем кодирует четыре rendition по очереди.
+10. Remote job скачивает source, проверяет диск и GPU pipeline, затем одним FFmpeg-процессом (общий decode, GPU-side split) кодирует все четыре rendition.
 11. После успеха всех rendition создаётся `master.m3u8` и проверяется структура результата.
 12. Origin делает resumable `rsync pull` в staging-каталог.
 13. Staging валидируется, служебные progress/log-файлы удаляются, HLS публикуется.
@@ -404,10 +404,10 @@ GPU preflight включает:
 1. `nvidia-smi`;
 2. проверку наличия encoder `h264_nvenc`;
 3. проверку CUDA filter `scale_cuda`;
-4. тестовое двухсекундное кодирование реального source:
+4. тестовое двухсекундное кодирование реального source **той же формы**, что и реальный encode — один decode, `split` на 4 ветки, 4 параллельных `h264_nvenc`:
 
 ```text
-NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null muxer
+NVDEC decode → split → 4× scale_cuda → 4× h264_nvenc (параллельно) → null muxer
 ```
 
 Проверки `h264_nvenc`/`scale_cuda` захватывают вывод `ffmpeg -encoders`/`-filters` в переменную и ищут паттерн через `grep -q ... <<< "$var"`, а не через `producer | grep -q`. Прямой pipe в `grep -q` под `set -o pipefail` ломается даже при УСПЕШНОМ совпадении: `grep -q` завершается сразу по первому найденному совпадению, ffmpeg получает `SIGPIPE` на попытке дописать оставшийся вывод, и pipefail засчитывает это как код `141` — job падает на ровном месте, хотя NVENC/scale_cuda реально присутствуют.
@@ -416,7 +416,19 @@ NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null mux
 
 ## FFmpeg и ABR HLS
 
-Четыре rendition кодируются по очереди, один FFmpeg-процесс за раз, в фиксированном порядке 1080p → 720p → 480p → 360p:
+Один FFmpeg-процесс декодирует source **один раз** через NVDEC, затем делит кадры на GPU (`split`) на четыре ветки, каждая масштабируется отдельным `scale_cuda` и кодируется отдельным `h264_nvenc` — вместо четырёх независимых процессов, каждый из которых заново decode'ил бы весь source с нуля. Это официально документированный NVIDIA/FFmpeg паттерн 1:N transcode:
+
+```text
+source.mp4
+     │
+     ▼
+   NVDEC (один раз)
+     │
+     ├──────────► scale_cuda → 1080p → NVENC → HLS
+     ├──────────► scale_cuda → 720p  → NVENC → HLS
+     ├──────────► scale_cuda → 480p  → NVENC → HLS
+     └──────────► scale_cuda → 360p  → NVENC → HLS
+```
 
 | Rendition | Resolution | Video | Maxrate | Bufsize | Audio | CQ |
 |---|---:|---:|---:|---:|---:|---:|
@@ -427,40 +439,44 @@ NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null mux
 
 Общие параметры:
 
-- CUDA/NVDEC hardware decode;
-- `scale_cuda` без возврата frames в system RAM;
-- `h264_nvenc`, preset `p5`, tune `hq`, rate control `vbr`;
-- forced keyframe/IDR каждые 6 секунд;
+- один `-hwaccel cuda -hwaccel_output_format cuda` decode на весь job;
+- `[0:v]split=4[...]`, затем `scale_cuda` на каждую ветку — CUDA-фреймы никогда не возвращаются в system RAM;
+- `h264_nvenc`, preset `p5`, tune `hq`, rate control `vbr`, свой `-cq`/битрейт/аудио на каждый output;
+- forced keyframe/IDR каждые 6 секунд — на каждый output отдельно, без stream-index суффиксов (`-force_key_frames`/`-forced-idr` позиционно scoped на "текущий" output, что явно проверено — суффикс `:N` для этого не нужен и не всегда предсказуем);
 - HLS VOD, `hls_time=6`, `independent_segments`;
-- optional first audio stream: видео без audio также допустимо;
-- stdout/stderr каждого процесса сохраняется в отдельный `ffmpeg.log`.
+- optional первый audio stream, замаплен в каждый output отдельно (`0:a:0?`);
+- stdout/stderr всего процесса — один общий `/workspace/out/ffmpeg.log` (не по одному на rendition, как раньше).
 
 Структура remote output:
 
 ```text
 /workspace/out/
 ├── master.m3u8
+├── ffmpeg.log
+├── progress.txt
 ├── 1080p/
 │   ├── index.m3u8
-│   ├── segment_00000.ts ...
-│   ├── progress.txt
-│   └── ffmpeg.log
+│   └── segment_00000.ts ...
 ├── 720p/
 ├── 480p/
 └── 360p/
 ```
 
-Если очередной FFmpeg завершается с ошибкой, `run_variant` сразу печатает tails всех четырёх `ffmpeg.log` (для уже пройденных rendition это будет успешный лог, для текущего — причина сбоя) и останавливает job, не запуская оставшиеся по очереди rendition. Master playlist создаётся только после успеха всех четырёх и проверки `#EXT-X-ENDLIST`/segments.
+Если процесс завершается с ошибкой, job сразу печатает tail единого `ffmpeg.log` и падает — до этого никакие rendition ещё не начинали писаться по отдельности, отменять нечего (всё было одним процессом). Master playlist создаётся только после успеха и проверки `#EXT-X-ENDLIST`/segments для всех четырёх.
 
-### Почему по очереди, а не параллельно
+### GPU preflight проверяет именно эту схему
 
-Каждый rendition получает выделенный NVDEC/NVENC на всё время своего прохода, без конкуренции за encoder sessions с соседними процессами — это particularly важно на бюджетных GPU (RTX 3060/A2000/4060 из allow-list), где параллельный запуск четырёх NVENC-сессий одновременно может делить друг друга и непредсказуемо влиять на скорость каждой. Компромисс — суммарное время job для одного видео растёт (сумма времени всех rendition вместо максимума), но каждый отдельный rendition кодируется на полной скорости своего слота, и логи/прогресс каждого этапа проще читать последовательно, один за другим.
+Двухсекундный preflight-тест (см. [Проверка GPU и диска](#проверка-gpu-и-диска)) теперь гоняет тот же `split` + 4× `scale_cuda` + 4× `h264_nvenc`, что и реальный encode — а не одну ветку, как раньше. Если GPU физически не тянет несколько NVENC-сессий сразу, это выяснится за 2 секунды, а не спустя часы реального job.
+
+### Один физический NVENC на GPU не значит "без выигрыша"
+
+Официальная матрица NVIDIA: RTX 3060/A2000/4060 (текущий `--gpus` allow-list) и даже RTX 3090 — по **одному** физическому NVENC-чипу; RTX 4070 Ti и новее — по два; RTX 5090 — три. На одном физическом NVENC четыре encode-сессии всё равно делят одно и то же кодирующее железо по времени, независимо от того, идут ли они как один процесс с `split` или как четыре отдельных — это ограничение железа, не архитектуры. Выигрыш общего decode+split в первую очередь в том, что NVDEC decode и чтение/фильтрация source выполняются **один раз** вместо четырёх, и в упрощении процесса (один PID вместо четырёх, один общий лог). На GPU с несколькими физическими NVENC (4070 Ti+, 5080+, 5090) тот же код автоматически получит настоящий выигрыш от параллельных sessions на разных encoder engines, если когда-нибудь такие карты попадут в `--gpus`.
 
 ## Live UI, progress и логи
 
 ### FFmpeg progress
 
-Обычный stderr `-stats` не парсится. Каждый процесс получает собственный `-progress` endpoint через FIFO. Relay на remote стороне собирает полный record до строки `progress=...`, записывает временный файл и делает `mv` в `progress.txt`. Origin поэтому не читает наполовину записанные records.
+Обычный stderr `-stats` не парсится. Единственный ABR-процесс получает один `-progress` endpoint через FIFO — так как все четыре rendition кодируются из одного decode, у FFmpeg нет отдельного `frame=`/`out_time=`/`speed=` на каждый output (multi-output `-progress` репортит их агрегированно на весь процесс; отдельные есть только `stream_N_0_q`, качество на поток), так что единый прогресс — не потеря информации, а точное отражение того, что все rendition физически идут в одном темпе. Relay на remote стороне собирает полный record до строки `progress=...`, записывает временный файл и делает `mv` в `progress.txt`. Origin поэтому не читает наполовину записанные records.
 
 Хвост `bootstrap.log`/`job.log` для панели "Remote log tail" читается через `tail -c 4000 <файл>` для каждого файла, а не через `cat` целиком — во время download aria2 непрерывно дописывает в `job.log` (прогресс каждую секунду), и `cat` растущего файла на **каждом** опросе (`--monitor-interval`) со временем всё дольше идёт по SSH; `tail -c` не сканирует файл целиком независимо от его размера.
 
@@ -476,7 +492,7 @@ ETA        = (duration - out_time) / speed
 Весь запуск, от разбора аргументов до `finally` с destroy instance, рендерится как одно [Rich](https://rich.readthedocs.io/) full-screen приложение (`ui/app.py`, alternate screen buffer — как у `htop`/`vim`), а не серия отдельных Live-виджетов. Экран разбит на три зоны:
 
 1. **Header** — название и текущая фаза (`searching offers`, `provisioning`, `encoding`, `transferring result`, `done`/`failed`);
-2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/**cost so far**/SSH, download+GPU/NVENC/NVDEC/VRAM, progress по 1080p/720p/480p/360p, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
+2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/**cost so far**/SSH, download+GPU/NVENC/NVDEC/VRAM, единый прогресс общего decode+split — media time/FPS/speed/ETA — со статичной строкой битрейт-ladder, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
 3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
 
 Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением. Перерисовка идёт раз в секунду (`refresh_per_second=1`); `set_body`/`append_log` только обновляют данные `Layout`, без принудительного немедленного `refresh()` — иначе всплеск строк лога (например, вывод `apt-get`, ретранслируемый через `RemoteLogTailer`) вызывал бы столько же немедленных полных перерисовок подряд, что особенно заметно при просмотре через SSH-сессию на сам сервер.
@@ -575,7 +591,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 
 - tail `/workspace/bootstrap.log`;
 - tail `/workspace/job.log`;
-- tail `ffmpeg.log` каждого rendition.
+- tail единого `/workspace/out/ffmpeg.log` (весь ABR-процесс пишет в один файл).
 
 Обрабатываются, среди прочего:
 
@@ -589,7 +605,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 - aria2/source failure;
 - недостаток remote disk space;
 - отсутствие NVENC/NVDEC/`scale_cuda`;
-- падение одного FFmpeg;
+- сбой ABR-процесса (единый decode+split+encode);
 - job timeout;
 - прерванный/resumable rsync;
 - неполный HLS result;

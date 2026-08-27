@@ -10,9 +10,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from ..core.constants import RENDITIONS
 from ..core.models import DashboardContext, RemoteSnapshot
 from .formatting import bar, format_bytes, format_cost, format_duration
+
+LADDER_SUMMARY = "1080p 6500k  ·  720p 3500k  ·  480p 1800k  ·  360p 900k"
 
 
 def render_dashboard(ctx: DashboardContext, snap: RemoteSnapshot) -> Group:
@@ -63,40 +64,39 @@ def render_dashboard(ctx: DashboardContext, snap: RemoteSnapshot) -> Group:
         ),
     )
 
+    # One shared NVDEC decode feeds all four renditions (GPU-side split), so
+    # they share a single progress feed by construction -- FFmpeg's
+    # `-progress` protocol reports one frame/out_time/speed for the whole
+    # multi-output process, not one per rendition.
+    encode = snap.encode
+    duration = snap.duration_seconds
+    pct = (encode.out_time_seconds / duration * 100.0) if duration > 0 else 0.0
+    if encode.progress == "end":
+        pct = 100.0
+    pct = max(0.0, min(100.0, pct))
+    remaining_media = max(0.0, duration - encode.out_time_seconds) if duration > 0 else 0.0
+    eta = remaining_media / encode.speed if encode.speed > 0 else None
+    state_style = (
+        "green"
+        if encode.progress == "end"
+        else ("cyan" if encode.out_time_seconds > 0 else "dim")
+    )
+
     progress_table = Table(expand=True, header_style="bold cyan")
-    progress_table.add_column("Quality", no_wrap=True)
     progress_table.add_column("Progress", ratio=2)
     progress_table.add_column("Media time", justify="right")
     progress_table.add_column("FPS", justify="right")
     progress_table.add_column("Speed", justify="right")
     progress_table.add_column("ETA", justify="right")
     progress_table.add_column("State", justify="right")
-
-    duration = snap.duration_seconds
-    for q in RENDITIONS:
-        vp = snap.variants[q]
-        pct = (vp.out_time_seconds / duration * 100.0) if duration > 0 else 0.0
-        if vp.progress == "end":
-            pct = 100.0
-        pct = max(0.0, min(100.0, pct))
-        remaining_media = (
-            max(0.0, duration - vp.out_time_seconds) if duration > 0 else 0.0
-        )
-        eta = remaining_media / vp.speed if vp.speed > 0 else None
-        state_style = (
-            "green"
-            if vp.progress == "end"
-            else ("cyan" if vp.out_time_seconds > 0 else "dim")
-        )
-        progress_table.add_row(
-            q,
-            Text.assemble(bar(pct), f" {pct:5.1f}%"),
-            f"{format_duration(vp.out_time_seconds)} / {format_duration(duration)}",
-            f"{vp.fps:.1f}" if vp.fps else "-",
-            f"{vp.speed:.2f}x" if vp.speed else "-",
-            format_duration(eta),
-            Text(vp.progress, style=state_style),
-        )
+    progress_table.add_row(
+        Text.assemble(bar(pct), f" {pct:5.1f}%"),
+        f"{format_duration(encode.out_time_seconds)} / {format_duration(duration)}",
+        f"{encode.fps:.1f}" if encode.fps else "-",
+        f"{encode.speed:.2f}x" if encode.speed else "-",
+        format_duration(eta),
+        Text(encode.progress, style=state_style),
+    )
 
     remote_text = Text(
         snap.remote_log_tail or "Waiting for remote log output...", style="dim"
@@ -105,6 +105,10 @@ def render_dashboard(ctx: DashboardContext, snap: RemoteSnapshot) -> Group:
     return Group(
         Panel(summary, title="Vast.ai encoder", border_style="cyan"),
         Panel(Group(download_text, gpu), title="Resources", border_style="blue"),
-        Panel(progress_table, title="ABR encode", border_style="green"),
+        Panel(
+            Group(progress_table, Text(LADDER_SUMMARY, style="dim")),
+            title="ABR encode (1 decode -> 4x GPU split -> NVENC)",
+            border_style="green",
+        ),
         Panel(remote_text, title="Remote log tail", border_style="magenta"),
     )

@@ -130,7 +130,7 @@ def wait_for_job(
                     host,
                     port,
                     "echo '=== job.log ==='; tail -n 200 /workspace/job.log || true; "
-                    'for q in 1080p 720p 480p 360p; do echo "=== $q ==="; tail -n 100 /workspace/out/$q/ffmpeg.log 2>/dev/null || true; done',
+                    "echo '=== ffmpeg.log ==='; tail -n 200 /workspace/out/ffmpeg.log 2>/dev/null || true",
                     timeout=40,
                 )
                 raise VastError(

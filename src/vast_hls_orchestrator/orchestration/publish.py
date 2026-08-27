@@ -129,12 +129,8 @@ def rsync_results(
         if not any(p.is_file() and p.stat().st_size > 0 for p in (staging / q).glob("segment_*.ts")):
             raise VastError(f"No HLS segments found for {q}")
 
-    for path in staging.glob("*/ffmpeg.log"):
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    for path in staging.glob("*/progress.txt"):
+    for name in ("ffmpeg.log", "progress.txt"):
+        path = staging / name
         try:
             path.unlink()
         except OSError:

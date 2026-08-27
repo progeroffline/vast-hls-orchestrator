@@ -5,9 +5,8 @@ from __future__ import annotations
 import argparse
 import re
 
-from ..core.constants import RENDITIONS
 from ..core.errors import VastError
-from ..core.models import RemoteSnapshot, VariantProgress
+from ..core.models import EncodeProgress, RemoteSnapshot
 from .ssh import ssh_run
 
 
@@ -32,7 +31,7 @@ def parse_speed(value: str) -> float:
         return 0.0
 
 
-def parse_progress_block(name: str, block: str) -> VariantProgress:
+def parse_progress_block(block: str) -> EncodeProgress:
     # Native -progress is record based. Use only the last complete record if a
     # non-atomic/older remote script is encountered while it is writing.
     lines = block.splitlines()
@@ -56,8 +55,7 @@ def parse_progress_block(name: str, block: str) -> VariantProgress:
     elif values.get("out_time"):
         out_seconds = parse_time_value(values["out_time"])
 
-    return VariantProgress(
-        name=name,
+    return EncodeProgress(
         frame=int(float(values.get("frame", "0") or 0)),
         fps=float(values.get("fps", "0") or 0),
         out_time_seconds=out_seconds,
@@ -78,11 +76,9 @@ printf 'META_STATUS='; if [ -f /workspace/JOB_DONE ]; then printf 'DONE:'; cat /
 printf 'META_DOWNLOADED='; stat -c %s /workspace/input/source.mp4 2>/dev/null || echo 0
 printf 'META_DURATION='; cat /workspace/input/duration.txt 2>/dev/null || echo 0
 printf 'META_GPU='; nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null || true
-for q in 1080p 720p 480p 360p; do
-  echo "PROGRESS_BEGIN:$q"
-  cat "/workspace/out/$q/progress.txt" 2>/dev/null || true
-  echo "PROGRESS_END:$q"
-done
+echo 'PROGRESS_BEGIN'
+cat /workspace/out/progress.txt 2>/dev/null || true
+echo 'PROGRESS_END'
 echo 'REMOTE_LOG_BEGIN'
 {{ tail -c 4000 /workspace/bootstrap.log 2>/dev/null; tail -c 4000 /workspace/job.log 2>/dev/null; }} | tr '\r' '\n' | tail -n 8 || true
 echo 'REMOTE_LOG_END'
@@ -93,9 +89,9 @@ echo 'REMOTE_LOG_END'
 
     snapshot = RemoteSnapshot()
     lines = result.stdout.splitlines()
-    progress_blocks: dict[str, list[str]] = {q: [] for q in RENDITIONS}
-    current_q: str | None = None
+    in_progress = False
     in_log = False
+    progress_lines: list[str] = []
     remote_log: list[str] = []
 
     for line in lines:
@@ -104,6 +100,11 @@ echo 'REMOTE_LOG_END'
                 in_log = False
             else:
                 remote_log.append(line)
+        elif in_progress:
+            if line == "PROGRESS_END":
+                in_progress = False
+            else:
+                progress_lines.append(line)
         elif line.startswith("META_STAGE="):
             snapshot.stage = line.split("=", 1)[1].strip() or "unknown"
         elif line.startswith("META_STATUS="):
@@ -139,16 +140,11 @@ echo 'REMOTE_LOG_END'
                     ) = values[:6]
                 except ValueError:
                     pass
-        elif line.startswith("PROGRESS_BEGIN:"):
-            current_q = line.split(":", 1)[1]
-        elif line.startswith("PROGRESS_END:"):
-            current_q = None
+        elif line == "PROGRESS_BEGIN":
+            in_progress = True
         elif line == "REMOTE_LOG_BEGIN":
             in_log = True
-        elif current_q in progress_blocks:
-            progress_blocks[current_q].append(line)
 
-    for q in RENDITIONS:
-        snapshot.variants[q] = parse_progress_block(q, "\n".join(progress_blocks[q]))
+    snapshot.encode = parse_progress_block("\n".join(progress_lines))
     snapshot.remote_log_tail = "\n".join(remote_log).strip()
     return snapshot
