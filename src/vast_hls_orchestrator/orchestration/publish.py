@@ -8,6 +8,7 @@ import errno
 import os
 import shlex
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -15,8 +16,6 @@ from loguru import logger
 
 from ..core.constants import RENDITIONS
 from ..core.errors import VastError
-from ..ui.app import TuiApp
-from .transfer import stream_process
 
 
 def atomic_exchange_dirs(left: Path, right: Path) -> bool:
@@ -49,7 +48,7 @@ def atomic_exchange_dirs(left: Path, right: Path) -> bool:
 
 
 def rsync_results(
-    args: argparse.Namespace, host: str, port: int, instance_id: int, app: TuiApp
+    args: argparse.Namespace, host: str, port: int, instance_id: int
 ) -> Path:
     dest = args.origin_root / args.video_id / "abr"
     staging = args.origin_root / args.video_id / f"abr.staging.{instance_id}"
@@ -96,15 +95,18 @@ def rsync_results(
     ]
     last_error: Exception | None = None
     for attempt in range(1, args.rsync_retries + 1):
+        logger.info(
+            "Pulling encoded HLS from Vast.ai to Binary Racks... (attempt {}/{})",
+            attempt,
+            args.rsync_retries,
+        )
         try:
-            stream_process(
-                cmd,
-                label=(
-                    "Pulling encoded HLS from Vast.ai to Binary Racks... "
-                    f"(attempt {attempt}/{args.rsync_retries})"
-                ),
-                app=app,
-            )
+            # rsync inherits our stdout/stderr directly: --info=progress2 draws
+            # its own single-line \r progress just fine on a real terminal
+            # without us needing to capture and re-render it ourselves.
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                raise VastError(f"rsync failed with exit code {result.returncode}")
             last_error = None
             break
         except Exception as exc:

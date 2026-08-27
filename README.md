@@ -20,7 +20,7 @@ Production-oriented Python-orchestrator для временного HLS-тран
 - [Загрузка исходного видео](#загрузка-исходного-видео)
 - [Проверка GPU и диска](#проверка-gpu-и-диска)
 - [FFmpeg и ABR HLS](#ffmpeg-и-abr-hls)
-- [Live UI, progress и логи](#live-ui-progress-и-логи)
+- [Прогресс и логи](#прогресс-и-логи)
 - [Получение и публикация результата](#получение-и-публикация-результата)
 - [Cleanup, watchdog и обработка ошибок](#cleanup-watchdog-и-обработка-ошибок)
 - [Параметры командной строки](#параметры-командной-строки)
@@ -64,38 +64,32 @@ src/vast_hls_orchestrator/
 │   ├── constants.py             # API endpoints, allow-list GPU, имена renditions
 │   ├── errors.py                 # иерархия исключений (VastError и наследники)
 │   ├── console.py                 # общий Rich Console (stderr)
-│   ├── logging_setup.py            # Loguru → Rich sink / панель Log активного TUI
-│   ├── tui_state.py                 # registry активного TuiApp (без зависимости core → ui)
-│   ├── models.py                     # dataclasses: VariantProgress, RemoteSnapshot, DashboardContext
+│   ├── logging_setup.py            # Loguru → Rich sink (обычная построчная печать)
+│   ├── models.py                     # dataclasses: EncodeProgress, RemoteSnapshot, JobContext
 │   └── validation.py                  # validate_inputs() для CLI-аргументов
 │
 ├── vast_api/                  # HTTP-клиент Vast.ai marketplace
 │   ├── client.py                 # VastClient: search/create/show/destroy instance
-│   └── offers.py                  # оценка размера source, ranking, таблица offers (без вывода)
+│   └── offers.py                  # оценка размера source, ranking, поиск+таблица offers
 │
 ├── remote/                    # всё, что выполняется на/через временный Vast instance
-│   ├── job_script.py             # bash-скрипт: download, GPU preflight, последовательный ABR encode
-│   ├── onstart.py                  # bootstrap (`onstart`): watchdog, apt-get, запуск job
-│   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh
+│   ├── job_script.py             # bash-скрипт: download, GPU preflight, ABR encode (split+NVENC)
+│   ├── onstart.py                  # bootstrap (`onstart`): запись SSH-ключа, watchdog, запуск job
+│   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh (spinner, один endpoint)
 │   └── snapshot.py                   # парсинг FFmpeg `-progress` и nvidia-smi по SSH
 │
-├── ui/                         # единое full-screen TUI-приложение (Rich)
-│   ├── app.py                    # TuiApp: постоянный alternate-screen Live, header/body/log
-│   ├── phases.py                   # spinner/summary панели для фаз без своего дашборда
-│   ├── formatting.py                # format_duration/format_bytes/bar
-│   └── dashboard.py                   # четырёхпанельный контент body во время encoding
+├── ui/
+│   └── formatting.py            # format_duration/format_bytes/format_cost — общие форматтеры лога
 │
 └── orchestration/              # жизненный цикл instance и результата
-    ├── provisioning.py            # rent_instance, wait_for_running, ensure_ssh_key_attached
-    ├── remote_logs.py               # RemoteLogTailer: container-логи Vast без SSH → Log-панель
-    ├── job_monitor.py                 # wait_for_job: SSH-поллинг + app.set_body(dashboard)
-    ├── transfer.py                     # stream_process: app.set_body(...) для rsync-строки
-    ├── publish.py                       # atomic_exchange_dirs, rsync_results
-    ├── local_state.py                    # file lock на video_id, recovery прерванного publish
-    └── diagnostics.py                     # tail удалённых логов → app.append_log на сбое
+    ├── provisioning.py            # rent_instance, wait_for_running, read_public_key
+    ├── job_monitor.py               # wait_for_job: SSH-поллинг + периодические строки прогресса
+    ├── publish.py                    # atomic_exchange_dirs, rsync_results (plain subprocess)
+    ├── local_state.py                 # file lock на video_id, recovery прерванного publish
+    └── diagnostics.py                  # tail удалённых логов при сбое
 ```
 
-Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень, зависят от всего перечисленного. Ни один низкоуровневый модуль не открывает собственный Rich `Live`/`console.status` — на весь процесс существует ровно один `Live` (`TuiApp`), и все фазы лишь подменяют его `body`.
+Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень. Никакого постоянного полноэкранного режима нет: вывод — обычный последовательный лог, спиннеры (`console.status`) на время конкретной операции (поиск offers, ожидание running/SSH) и периодические строки прогресса во время encoding — так же, как повёл бы себя любой обычный CLI-инструмент.
 
 ## Полный жизненный цикл job
 
@@ -314,19 +308,13 @@ Offers сортируются лексикографически по следу
 ```text
 image:        nvidia/cuda:12.6.3-runtime-ubuntu24.04
 disk:         40 GB
-runtype:      ssh_direct ssh_proxy
+runtype:      ssh_direct
 target_state: running
 cancel_unavail: true
 NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ```
 
 Также передаются уникальный label и `onstart` script. Label используется не только для удобства: если TCP-соединение оборвалось после PUT и неизвестно, создал ли Vast instance, orchestrator ищет instance через `GET /api/v1/instances` с точным label. До завершения reconciliation новый offer не арендуется — это защищает от «потерянного» платного instance.
-
-### Direct SSH с fallback на proxy SSH
-
-`runtype` запрашивает оба способа подключения одновременно (как это делает официальный `vastai ssh --direct`, а не только `ssh_direct` в одиночку). Причина: у direct SSH per-instance reverse-tunnel на конкретном host может не зарегистрироваться (на практике это проявлялось повторяющимся `remote port forwarding failed for listen port <port>` в логах инстанса), даже когда сам контейнер полностью здоров. Proxy SSH идёт через отдельную инфраструктуру Vast и от этого не зависит.
-
-`wait_for_ssh` поэтому пробует **оба** адреса на каждой попытке — `ssh_host`/`ssh_port` (direct) и `ssh_proxy_addr`/`ssh_proxy_port` (proxy) из ответа `show_instance` — и возвращает тот, что реально ответил первым. Если сработал только proxy, дальнейший мониторинг (`wait_for_job`) и `rsync` идут уже через него; при этом сверка «не сменил ли Vast SSH endpoint» также сравнивается с полями нужного типа (proxy или direct), а не всегда с direct — иначе успешное proxy-подключение тут же перезаписывалось бы обратно нерабочим direct-адресом.
 
 API retries:
 
@@ -349,9 +337,7 @@ grep -qxF "<публичная часть --ssh-key>" /root/.ssh/authorized_keys
   printf '%s\n' "<публичная часть --ssh-key>" >> /root/.ssh/authorized_keys
 ```
 
-`grep -qxF` перед добавлением делает это идемпотентным (повторный запуск/перезапуск bootstrap не задублирует строку). Публичная часть берётся из `<--ssh-key>.pub`, а если такого файла нет — извлекается из приватного ключа через `ssh-keygen -y -f <--ssh-key>` (ключ должен быть без passphrase, как и для всех остальных non-interactive SSH-операций); без публичного ключа orchestrator не арендует instance вообще.
-
-Аккаунтный `POST /api/v0/instances/<id>/ssh` (attach) всё ещё вызывается дополнительно, но теперь как best-effort резерв, а не как гарантия: ошибка или несовпадение с `GET .../ssh` только логируется `WARNING`, pipeline не прерывается — фактический доступ уже обеспечен записью в onstart.
+`grep -qxF` перед добавлением делает это идемпотентным (повторный запуск/перезапуск bootstrap не задублирует строку). Публичная часть берётся из `<--ssh-key>.pub`, а если такого файла нет — извлекается из приватного ключа через `ssh-keygen -y -f <--ssh-key>` (ключ должен быть без passphrase, как и для всех остальных non-interactive SSH-операций); без публичного ключа orchestrator не арендует instance вообще. Это единственный и достаточный механизм — никаких дополнительных вызовов Vast API для привязки/проверки ключа нет.
 
 ## Bootstrap и remote job
 
@@ -472,7 +458,7 @@ source.mp4
 
 Официальная матрица NVIDIA: RTX 3060/A2000/4060 (текущий `--gpus` allow-list) и даже RTX 3090 — по **одному** физическому NVENC-чипу; RTX 4070 Ti и новее — по два; RTX 5090 — три. На одном физическом NVENC четыре encode-сессии всё равно делят одно и то же кодирующее железо по времени, независимо от того, идут ли они как один процесс с `split` или как четыре отдельных — это ограничение железа, не архитектуры. Выигрыш общего decode+split в первую очередь в том, что NVDEC decode и чтение/фильтрация source выполняются **один раз** вместо четырёх, и в упрощении процесса (один PID вместо четырёх, один общий лог). На GPU с несколькими физическими NVENC (4070 Ti+, 5080+, 5090) тот же код автоматически получит настоящий выигрыш от параллельных sessions на разных encoder engines, если когда-нибудь такие карты попадут в `--gpus`.
 
-## Live UI, progress и логи
+## Прогресс и логи
 
 ### FFmpeg progress
 
@@ -487,35 +473,33 @@ percentage = out_time / ffprobe_duration × 100
 ETA        = (duration - out_time) / speed
 ```
 
-### Полноэкранное приложение
+### Обычный последовательный вывод, без постоянного полноэкранного режима
 
-Весь запуск, от разбора аргументов до `finally` с destroy instance, рендерится как одно [Rich](https://rich.readthedocs.io/) full-screen приложение (`ui/app.py`, alternate screen buffer — как у `htop`/`vim`), а не серия отдельных Live-виджетов. Экран разбит на три зоны:
+Orchestrator — обычный CLI-инструмент: вывод идёт построчно в scrollback терминала, ничего не перерисовывается поверх себя и не занимает терминал целиком. Полноэкранный alternate-screen режим (как у `htop`) в проекте пробовали, но он оказался источником нестабильности (зависания/визуальные глюки при просмотре через SSH-сессию на сам сервер) без сопоставимой пользы — поэтому от него отказались в пользу простого лога.
 
-1. **Header** — название и текущая фаза (`searching offers`, `provisioning`, `encoding`, `transferring result`, `done`/`failed`);
-2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/**cost so far**/SSH, download+GPU/NVENC/NVDEC/VRAM, единый прогресс общего decode+split — media time/FPS/speed/ETA — со статичной строкой битрейт-ladder, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
-3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
+`console.status(...)` (короткий спиннер) используется только на время одной конкретной операции, где ожидание может затянуться: поиск offers, ожидание `running`, ожидание живого SSH. Каждый спиннер сам исчезает, как только операция завершается, и не оставляет постоянного состояния после себя.
 
-Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением. Перерисовка идёт раз в секунду (`refresh_per_second=1`); `set_body`/`append_log` только обновляют данные `Layout`, без принудительного немедленного `refresh()` — иначе всплеск строк лога (например, вывод `apt-get`, ретранслируемый через `RemoteLogTailer`) вызывал бы столько же немедленных полных перерисовок подряд, что особенно заметно при просмотре через SSH-сессию на сам сервер.
+### Прогресс encoding — периодические строки лога
 
-### Стоимость job в реальном времени
+Пока идёт encoding, каждые `--monitor-interval` секунд orchestrator опрашивает удалённую машину по SSH (stage, размер скачанного файла, `-progress` FFmpeg, `nvidia-smi`), но печатает сводку не на каждый опрос, а не чаще раза в 10 секунд — иначе короткий `--monitor-interval` превратился бы в спам логов. Строка выглядит так:
 
-`Cost so far` в дашборде — это `цена offer ($/h) × время с момента фактической аренды / 3600`, то есть накопленные расходы на **этот** instance к текущему моменту, а не оценка на весь job. Отсчёт времени идёт с момента успешного создания instance (`rent_instance`), а не с начала мониторинга encoding — provisioning, bootstrap и download тоже платные и должны входить в сумму. Обновляется вместе с остальным дашбордом (`--monitor-interval`). При завершении job (успех, `Ctrl+C` или сбой) тот же расчёт печатается как `Total cost` на итоговом экране и в лог — оплата идёт независимо от результата, поэтому сумма показывается во всех трёх случаях.
+```text
+Progress: stage=encoding  download=100.0% (9.4 GiB/9.4 GiB)  media=00:02:14/00:10:00  fps=48.2  speed=1.35x  cost=$0.0142
+```
 
-### Логи самой Vast-машины (до появления SSH)
+`cost` — это `цена offer ($/h) × время с момента фактической аренды instance / 3600`, то есть накопленные расходы на **этот** instance к текущему моменту (а не оценка на весь job). Отсчёт времени идёт с момента успешного создания instance (`rent_instance`), а не с начала мониторинга encoding — provisioning, bootstrap и download тоже платные и должны входить в сумму. При завершении job (успех, `Ctrl+C` или сбой) тот же расчёт печатается как `Total cost` — оплата идёт независимо от результата, поэтому строка появляется во всех трёх случаях.
 
-Пока instance провижинится и пока `wait_for_ssh` ждёт живой SSH (SSH ещё может быть недоступен, например ключ не был вовремя добавлен в аккаунт или прописан не на тот instance), `RemoteLogTailer` (`orchestration/remote_logs.py`) параллельно опрашивает собственный log-эндпоинт Vast.ai — `PUT /api/v0/instances/request_logs/<id>/` — который отдаёт container-логи инстанса **без SSH**. Новые строки дублируются в панель **Log** с префиксом `[vast]`, поэтому видно, что происходит на машине (pull образа, старт контейнера, инициализация sshd), даже если SSH так и не поднимется. Опрос самоограничен (не чаще раза в 5 секунд), чтобы не замедлять цикл ожидания SSH.
+Переходы стадии (`stage=download` → `stage=encoding` → ...) и статуса логируются сразу, отдельной строкой, а не только в периодической сводке.
 
-### Loguru и recap после выхода
+### Loguru
 
-[Loguru](https://loguru.readthedocs.io/) направляется в собственный sink:
+[Loguru](https://loguru.readthedocs.io/) направляется в собственный sink, печатающий прямо в терминал:
 
-- `INFO` — stages, выбранный offer, endpoint, transfer lifecycle;
+- `INFO` — stages, выбранный offer, endpoint, transfer lifecycle, периодический progress;
 - `SUCCESS` — SSH ready, encode complete, publish и destroy;
-- `WARNING` — transient API/SSH/rsync failures, fallback и recovery;
+- `WARNING` — transient API/SSH/rsync failures и recovery;
 - `ERROR` — понятная причина окончательного сбоя;
-- `DEBUG` — API attempts, remote commands и дополнительные remote log changes; включается `--verbose`.
-
-Пока полноэкранное приложение активно, все log-записи идут в панель **Log**, а не печатаются напрямую в терминал. Alternate screen buffer терминала стирается в момент выхода из приложения, поэтому сразу после закрытия full-screen режима оркестратор печатает весь накопленный лог обратно в обычный scrollback терминала (`TuiApp.print_recap()`) — это единственная информация, которая у оператора остаётся после завершения job, включая diagnostics при сбое (tail bootstrap/job/ffmpeg логов).
+- `DEBUG` — API attempts, remote commands и remote log changes; включается `--verbose`.
 
 API keys и private key contents не логируются.
 
@@ -579,11 +563,10 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 
 При первом Ctrl+C:
 
-1. активный rsync получает terminate, затем kill при необходимости;
-2. управление переходит в `except KeyboardInterrupt` / Python `finally` внутри полноэкранного приложения;
+1. активный rsync (обычный foreground subprocess) получает SIGINT от терминала вместе с самим orchestrator;
+2. управление переходит в `except KeyboardInterrupt` / Python `finally`;
 3. Vast instance удаляется;
-4. full-screen приложение закрывается (alternate screen restore) и лог реплеится в обычный терминал;
-5. процесс возвращает exit code `130`.
+4. процесс возвращает exit code `130`.
 
 ### Диагностика ошибок
 
@@ -650,7 +633,7 @@ uv run vast-hls-orchestrator --help
 ### Python
 
 - [Requests](https://requests.readthedocs.io/) — HTTPS-клиент Vast API и HEAD source URL.
-- [Rich](https://rich.readthedocs.io/) — Live dashboard, panels, tables, progress bars и terminal rendering.
+- [Rich](https://rich.readthedocs.io/) — styled log output, spinners (`console.status`) и таблица offers.
 - [Loguru](https://loguru.readthedocs.io/) — structured severity logging и exception output.
 - [argparse](https://docs.python.org/3/library/argparse.html) — CLI.
 - [subprocess](https://docs.python.org/3/library/subprocess.html) — безопасный запуск `ssh` и `rsync` без shell для локальных commands.

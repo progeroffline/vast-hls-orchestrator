@@ -1,4 +1,4 @@
-"""End-to-end job lifecycle, rendered as one persistent full-screen TUI application."""
+"""End-to-end job lifecycle: rent, provision, encode, transfer, publish, destroy."""
 
 from __future__ import annotations
 
@@ -10,69 +10,48 @@ from typing import Any
 
 from loguru import logger
 
-from .core.console import console
 from .core.errors import VastError
 from .core.validation import validate_inputs
 from .orchestration.diagnostics import collect_remote_diagnostics
 from .orchestration.job_monitor import wait_for_job
 from .orchestration.local_state import acquire_video_lock, recover_local_publish_state
-from .orchestration.provisioning import (
-    ensure_ssh_key_attached,
-    read_public_key,
-    rent_instance,
-    wait_for_running,
-)
+from .orchestration.provisioning import read_public_key, rent_instance, wait_for_running
 from .orchestration.publish import rsync_results
-from .orchestration.remote_logs import RemoteLogTailer
 from .remote.job_script import build_job_script
 from .remote.onstart import build_onstart
 from .remote.ssh import wait_for_ssh
-from .ui.app import TuiApp
 from .ui.formatting import format_cost, format_duration
-from .ui.phases import spinner_panel, summary_panel
 from .vast_api.client import VastClient
-from .vast_api.offers import choose_offers, render_offers_table, source_size_bytes
+from .vast_api.offers import choose_offers, source_size_bytes
 
 
-def _cost_summary(rental_started_at: float | None, selected_offer: dict | None) -> list[str]:
-    """Total spend so far, if we got far enough to have actually rented anything."""
+def _log_cost_summary(rental_started_at: float | None, selected_offer: dict | None) -> None:
+    """Log total spend so far, if we got far enough to have actually rented anything."""
     if rental_started_at is None or selected_offer is None:
-        return []
+        return
     hourly_price = float(selected_offer.get("dph_total") or 0)
     elapsed = time.time() - rental_started_at
-    line = f"Total cost: {format_cost(hourly_price, elapsed)} ({format_duration(elapsed)} @ ${hourly_price:.4f}/h)"
-    return [line]
+    logger.info(
+        "Total cost: {} ({} @ ${:.4f}/h)",
+        format_cost(hourly_price, elapsed),
+        format_duration(elapsed),
+        hourly_price,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
-    app = TuiApp(console, title=f"Vast HLS Orchestrator — {args.video_id}")
-    try:
-        with app:
-            return _run(args, app)
-    finally:
-        # The alternate screen is gone the moment we leave it, so replay the
-        # captured log history to the normal terminal for the operator.
-        app.print_recap()
-
-
-def _run(args: argparse.Namespace, app: TuiApp) -> int:
     try:
         validate_inputs(args)
     except Exception as exc:
         logger.error("{}", exc)
-        app.set_body(summary_panel([str(exc)], style="red", title="Invalid arguments"))
         return 2
 
     api_key = os.getenv("VAST_API_KEY")
     if not api_key:
         logger.error("export VAST_API_KEY first")
-        app.set_body(summary_panel(["export VAST_API_KEY first"], style="red", title="Missing credentials"))
         return 2
     if not args.dry_run and not args.ssh_key.is_file():
         logger.error("SSH private key not found: {}", args.ssh_key)
-        app.set_body(
-            summary_panel([f"SSH private key not found: {args.ssh_key}"], style="red", title="Missing SSH key")
-        )
         return 2
 
     client = VastClient(api_key)
@@ -96,14 +75,9 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
     rental_started_at: float | None = None
     original_known_hosts = args.known_hosts
     try:
-        app.set_header_subtitle("searching offers")
-        app.set_body(spinner_panel("Searching Vast.ai offers..."))
         offers = choose_offers(client, args, input_gb)
-        app.set_body(render_offers_table(offers, input_gb, args.expected_hours))
-
         if args.dry_run:
             logger.success("Dry-run complete: {} matching offers; nothing rented", len(offers))
-            app.set_header_subtitle("dry-run complete")
             return 0
 
         lock_file = acquire_video_lock(args)
@@ -130,98 +104,50 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
         onstart = build_onstart(job_script, args.failsafe_seconds, public_key)
         create_label = f"hls-{args.video_id}-{int(time.time())}-{os.getpid()}"
 
-        app.set_header_subtitle("renting a GPU instance")
-        app.set_body(spinner_panel("Renting a Vast.ai GPU instance..."))
         instance_id, selected_offer, create_was_ambiguous = rent_instance(
             client, args, offers, create_label, onstart
         )
-        # Vast starts billing from here, not from whenever we later start the
-        # encode-monitoring dashboard -- provisioning/bootstrap/download all
-        # cost money too, and the displayed cost-so-far needs to include them.
+        # Vast starts billing from here, not from whenever encode-monitoring
+        # happens to start -- provisioning/bootstrap/download cost money too.
         rental_started_at = time.time()
 
-        # Best-effort account-level registration too; see ensure_ssh_key_attached.
-        ensure_ssh_key_attached(client, instance_id, public_key)
-
-        # Vast's own container logs work without SSH, so they're the only window
-        # into what the rented machine is doing until wait_for_ssh succeeds.
-        log_tailer = RemoteLogTailer(client, instance_id, app)
-
-        app.set_header_subtitle("provisioning")
-        app.set_body(spinner_panel(f"Provisioning instance {instance_id}..."))
-        info = wait_for_running(client, instance_id, args.boot_timeout, on_poll=log_tailer.poll)
+        info = wait_for_running(client, instance_id, args.boot_timeout)
         remote_host = str(info["ssh_host"])
         remote_port = int(info["ssh_port"])
-        proxy_host = info.get("ssh_proxy_addr")
-        proxy_port = info.get("ssh_proxy_port")
         logger.info("SSH endpoint: root@{}:{}", remote_host, remote_port)
 
-        app.set_body(spinner_panel(f"Waiting for SSH on {remote_host}:{remote_port}..."))
-        direct_host, direct_port = remote_host, remote_port
-        remote_host, remote_port = wait_for_ssh(
-            args,
-            direct_host,
-            direct_port,
-            proxy_host=str(proxy_host) if proxy_host else None,
-            proxy_port=int(proxy_port) if proxy_port else None,
-            on_poll=log_tailer.poll,
-        )
-        using_proxy = (remote_host, remote_port) != (direct_host, direct_port)
-        if using_proxy:
-            logger.warning("Direct SSH never came up; continuing over Vast's proxy SSH instead")
-
-        app.set_header_subtitle("encoding")
+        wait_for_ssh(args, remote_host, remote_port)
         remote_host, remote_port = wait_for_job(
             args,
             client,
             instance_id,
             remote_host,
             remote_port,
-            app=app,
             gpu_name=str(selected_offer.get("gpu_name") or "NVIDIA GPU"),
             hourly_price=float(selected_offer.get("dph_total") or 0),
             expected_input_bytes=input_bytes,
             rental_started_at=rental_started_at,
-            using_proxy=using_proxy,
         )
-
-        app.set_header_subtitle("transferring result")
-        dest = rsync_results(args, remote_host, remote_port, instance_id, app)
+        dest = rsync_results(args, remote_host, remote_port, instance_id)
         published = True
 
         logger.success("SUCCESS")
         logger.success("Master playlist: {}", dest / "master.m3u8")
-        cost_lines = _cost_summary(rental_started_at, selected_offer)
-        for line in cost_lines:
-            logger.success("{}", line)
-        app.set_header_subtitle("done")
-        app.set_body(
-            summary_panel([f"Published: {dest / 'master.m3u8'}", *cost_lines], title="Success")
-        )
+        _log_cost_summary(rental_started_at, selected_offer)
         return 0
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
-        cost_lines = _cost_summary(rental_started_at, selected_offer)
-        for line in cost_lines:
-            logger.warning("{}", line)
-        app.set_header_subtitle("interrupted")
-        app.set_body(
-            summary_panel(["Interrupted by user", *cost_lines], style="yellow", title="Interrupted")
-        )
+        _log_cost_summary(rental_started_at, selected_offer)
         return 130
     except Exception as exc:
         if remote_host is not None and remote_port is not None:
-            collect_remote_diagnostics(args, remote_host, remote_port, app)
+            collect_remote_diagnostics(args, remote_host, remote_port)
         if args.verbose:
             logger.exception("Pipeline failed: {}", exc)
         else:
             logger.error("Pipeline failed: {}", exc)
-        cost_lines = _cost_summary(rental_started_at, selected_offer)
-        for line in cost_lines:
-            logger.error("{}", line)
-        app.set_header_subtitle("failed")
-        app.set_body(summary_panel([str(exc), *cost_lines], style="red", title="Pipeline failed"))
+        _log_cost_summary(rental_started_at, selected_offer)
         return 1
     finally:
         if instance_id is not None:

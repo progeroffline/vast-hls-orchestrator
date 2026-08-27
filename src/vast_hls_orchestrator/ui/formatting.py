@@ -1,8 +1,6 @@
-"""Small display-value formatters shared by the dashboard."""
+"""Small display-value formatters shared by log lines."""
 
 from __future__ import annotations
-
-from rich.text import Text
 
 
 def format_duration(seconds: float | None) -> str:
@@ -28,12 +26,3 @@ def format_bytes(n: int | None) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} TiB"
-
-
-def bar(percent: float, width: int = 22) -> Text:
-    percent = max(0.0, min(100.0, percent))
-    filled = int(round(width * percent / 100.0))
-    text = Text()
-    text.append("█" * filled, style="green")
-    text.append("░" * (width - filled), style="grey37")
-    return text

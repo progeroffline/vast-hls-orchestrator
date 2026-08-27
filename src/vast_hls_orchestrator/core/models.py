@@ -1,4 +1,4 @@
-"""Dataclasses describing remote encode progress and dashboard rendering state."""
+"""Dataclasses describing remote encode progress and job monitoring state."""
 
 from __future__ import annotations
 
@@ -41,7 +41,9 @@ class RemoteSnapshot:
 
 
 @dataclass
-class DashboardContext:
+class JobContext:
+    """Identifies which instance/job a monitoring log line is about."""
+
     instance_id: int
     gpu_name: str
     hourly_price: float
