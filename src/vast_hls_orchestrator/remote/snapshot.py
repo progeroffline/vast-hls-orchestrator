@@ -89,7 +89,7 @@ echo 'PROGRESS_BEGIN'
 cat /workspace/out/progress.txt 2>/dev/null || true
 echo 'PROGRESS_END'
 echo 'REMOTE_LOG_BEGIN'
-{{ tail -c 4000 /workspace/bootstrap.log 2>/dev/null; tail -c 4000 /workspace/job.log 2>/dev/null; }} | tr '\r' '\n' | tail -n 8 || true
+{ tail -c 4000 /workspace/bootstrap.log 2>/dev/null; tail -c 4000 /workspace/job.log 2>/dev/null; } | tr '\r' '\n' | tail -n 8 || true
 echo 'REMOTE_LOG_END'
 """
     result = ssh_run(args, host, port, command, timeout=20)
