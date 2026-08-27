@@ -98,8 +98,10 @@ fi
 set_stage gpu-check
 echo "=== GPU and FFmpeg capabilities ==="
 nvidia-smi
-ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'
-ffmpeg -hide_banner -filters 2>/dev/null | grep -q 'scale_cuda'
+encoders_list="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
+grep -q 'h264_nvenc' <<< "$encoders_list"
+filters_list="$(ffmpeg -hide_banner -filters 2>/dev/null)"
+grep -q 'scale_cuda' <<< "$filters_list"
 echo "=== Hardware preflight (NVDEC + scale_cuda + NVENC) ==="
 ffmpeg -v warning -nostats \\
   -hwaccel cuda -hwaccel_output_format cuda -ss 0 -t 2 -i "$INPUT" \\

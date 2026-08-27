@@ -411,6 +411,8 @@ GPU preflight включает:
 NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null muxer
 ```
 
+Проверки `h264_nvenc`/`scale_cuda` захватывают вывод `ffmpeg -encoders`/`-filters` в переменную и ищут паттерн через `grep -q ... <<< "$var"`, а не через `producer | grep -q`. Прямой pipe в `grep -q` под `set -o pipefail` ломается даже при УСПЕШНОМ совпадении: `grep -q` завершается сразу по первому найденному совпадению, ffmpeg получает `SIGPIPE` на попытке дописать оставшийся вывод, и pipefail засчитывает это как код `141` — job падает на ровном месте, хотя NVENC/scale_cuda реально присутствуют.
+
 Таким образом проверяется не только наличие названий в `ffmpeg -encoders/-filters`, но и фактическая совместимость драйвера, FFmpeg, decode, CUDA scaling и NVENC.
 
 ## FFmpeg и ABR HLS

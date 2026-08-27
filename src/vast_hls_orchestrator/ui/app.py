@@ -52,24 +52,17 @@ class TuiApp:
 
     def set_header_subtitle(self, subtitle: str) -> None:
         self.layout["header"].update(self._header_panel(subtitle))
-        self._refresh()
 
     def set_body(self, renderable: RenderableType) -> None:
         self.layout["body"].update(renderable)
-        self._refresh()
 
     def append_log(self, line: str) -> None:
         self.log_buffer.append(line)
         self._render_log_panel()
-        self._refresh()
 
     def _render_log_panel(self) -> None:
         tail = "\n".join(list(self.log_buffer)[-LOG_PANEL_LINES:]) or "[dim]...[/]"
         self.layout["log"].update(Panel(tail, title="Log", border_style="magenta"))
-
-    def _refresh(self) -> None:
-        if self._active:
-            self.live.refresh()
 
     def __enter__(self) -> TuiApp:
         self.live.start(refresh=True)
@@ -86,7 +79,11 @@ class TuiApp:
         """Replay every captured log line to the normal screen after exit.
 
         The alternate screen buffer is gone by the time this runs, so this is
-        the operator's only remaining record of what happened.
+        the operator's only remaining record of what happened. Printed as one
+        joined block rather than one console.print() call per line -- with a
+        few thousand buffered lines, per-line printing is itself slow enough
+        to look like the program hung right at the moment it should be
+        handing control back.
         """
-        for line in self.log_buffer:
-            self.console.print(line, highlight=False)
+        if self.log_buffer:
+            self.console.print("\n".join(self.log_buffer), highlight=False)

@@ -201,13 +201,17 @@ class VastClient:
         Vast generates the dump asynchronously and hands back an S3 URL, which
         may briefly 404 before the upload completes -- callers are expected to
         poll this periodically and treat a `None` result as "not ready yet".
+
+        Kept to a short timeout: this runs inside on_poll callbacks in tight
+        SSH-readiness retry loops, so a slow/hanging request here shouldn't
+        stall those loops for long.
         """
         try:
             data = self.request(
                 "PUT",
                 f"/instances/request_logs/{instance_id}",
                 body={"tail": tail},
-                timeout=20,
+                timeout=8,
                 retry=False,
             )
         except VastError as exc:
@@ -221,7 +225,7 @@ class VastClient:
         try:
             # Deliberately a bare request, not self.s: result_url is a
             # presigned S3 link and must not receive our Vast API bearer token.
-            r = requests.get(result_url, timeout=20)
+            r = requests.get(result_url, timeout=8)
             r.raise_for_status()
             return r.text
         except requests.RequestException as exc:
