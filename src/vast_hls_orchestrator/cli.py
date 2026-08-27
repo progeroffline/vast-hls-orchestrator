@@ -42,21 +42,34 @@ def parse_args() -> argparse.Namespace:
             "by onstart since it's not baked into the image."
         ),
     )
-    parser.add_argument("--disk-gb", type=int, default=40)
+    parser.add_argument(
+        "--disk-gb",
+        type=int,
+        default=150,
+        help="Also the offer search's minimum required disk_space",
+    )
     parser.add_argument(
         "--max-hourly",
         type=float,
         default=0.80,
-        help=(
-            "Price ceiling; the default GPU allow-list includes cards like "
-            "RTX 4090/5090 and L40S/L4 that cost more per hour than a bare "
-            "RTX 3060, so this is higher than a budget-only ceiling would be"
-        ),
+        help="Price ceiling for the (RTX 4080-only, by default) offer search",
     )
     parser.add_argument("--min-reliability", type=float, default=0.98)
     parser.add_argument("--min-cpu", type=int, default=4)
-    parser.add_argument("--min-ram-mb", type=int, default=8192)
-    parser.add_argument("--min-disk-bw", type=float, default=200.0)
+    parser.add_argument("--min-ram-mb", type=int, default=16384)
+    parser.add_argument("--min-disk-bw", type=float, default=500.0)
+    parser.add_argument(
+        "--min-download-mbps",
+        type=float,
+        default=500.0,
+        help="Minimum offer inet_down (Mbps); higher (1 Gbps+) is preferred and used as a ranking tiebreaker",
+    )
+    parser.add_argument(
+        "--min-upload-mbps",
+        type=float,
+        default=500.0,
+        help="Minimum offer inet_up (Mbps); higher (1 Gbps+) is preferred and used as a ranking tiebreaker",
+    )
     parser.add_argument(
         "--expected-hours",
         type=float,
@@ -95,5 +108,14 @@ def parse_args() -> argparse.Namespace:
         help="Search and rank offers, but do not rent an instance",
     )
     parser.add_argument("--verbose", action="store_true", help="Show DEBUG log events")
-    parser.add_argument("--gpus", nargs="+", default=DEFAULT_GPUS)
+    parser.add_argument(
+        "--gpus",
+        nargs="+",
+        default=DEFAULT_GPUS,
+        help=(
+            "GPU model allow-list to search/rent (default: RTX 4080 only, "
+            "benchmarked as the best fit for this project's ABR pipeline -- "
+            "no other model is searched unless explicitly overridden here)"
+        ),
+    )
     return parser.parse_args()

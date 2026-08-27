@@ -96,7 +96,7 @@ src/vast_hls_orchestrator/
 1. Orchestrator проверяет аргументы, URL, `video_id`, API key и локальный SSH key.
 2. Для обычного запуска получает эксклюзивный file lock для конкретного `video_id`.
 3. Выполняет `HEAD` source URL, если сервер поддерживает его, и получает ожидаемый размер MP4.
-4. Запрашивает у Vast.ai подходящие offers по allow-list GPU (RTX 5090, L40S, RTX 4090, L4, RTX 5080, RTX 5070 Ti, A16, RTX 3060).
+4. Запрашивает у Vast.ai подходящие offers по allow-list GPU (по умолчанию — только RTX 4080).
 5. Объединяет, дедуплицирует и ранжирует offers по ожидаемой полной стоимости job.
 6. Принимает лучший доступный offer через Vast API и получает `instance_id`.
 7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint; если SSH так и не поднялся, делает `reboot` инстанса (это заново прогоняет `onstart` и пересобирает `authorized_keys` с нуля) и повторяет ожидание — до нескольких таких циклов подряд, прежде чем считать job проваленным (см. [SSH-ключ пишется в контейнер напрямую](#ssh-ключ-пишется-в-контейнер-напрямую-а-не-через-аккаунтную-инъекцию-vast)).
@@ -192,21 +192,23 @@ install -d -m 755 /var/www/html/video
 
 | Параметр | Значение |
 |---|---:|
-| GPU | RTX 5090, L40S, RTX 4090, L4, RTX 5080, RTX 5070 Ti, A16, RTX 3060 |
+| GPU | **только RTX 4080** (`--gpus`, без fallback на другую модель) |
 | GPU count | 1 |
 | Offer type | on-demand |
 | Verified | да |
 | Reliability | ≥ 0.98 |
 | Effective CPU | ≥ 4 cores |
-| RAM | ≥ 8192 MB |
-| Disk | ≥ 40 GB |
-| Disk bandwidth | ≥ 200 MB/s |
+| RAM | ≥ 16384 MB (16 GB) |
+| Disk | ≥ 150 GB |
+| Disk bandwidth | ≥ 500 MB/s |
+| Download speed (`inet_down`) | ≥ 500 Mbps (желательно 1 Gbps+, влияет на ранжирование) |
+| Upload speed (`inet_up`) | ≥ 500 Mbps (желательно 1 Gbps+, влияет на ранжирование) |
 | CUDA compatibility | ≥ 12.6 |
 | Total price | ≤ $0.80/hour |
 | Direct SSH ports | ≥ 1 |
 | Доступная длительность | boot timeout + job timeout |
 
-GPU allow-list подобран по числу аппаратных NVENC-энкодеров, а не только по цене — см. [Поиск, фильтрация и рейтинг машин](#поиск-фильтрация-и-рейтинг-машин). `RTX 3090` и чисто compute-карты (`A100`/`H100`/`B200`) намеренно исключены: у первой те же ограничения NVENC, что и у заметно более дешёвой `RTX 3060`, а у вторых аппаратного NVENC нет вообще. `--max-hourly` поднят с прежних `$0.08` — часть allow-list (RTX 4090/5090, L40S) стоит на Vast заметно дороже бюджетных карт.
+GPU allow-list — единственная модель, `RTX 4080` (`core.constants.DEFAULT_GPUS`), выбранная по прямому бенчмарку именно этого ABR pipeline (один decode, `split=4`, `preset p3`): ≈11.5x realtime при ≈90% NVENC utilization, тогда как `L40S` на том же job показала только ≈7.8x. Другие модели (`L4`, `L40`, `L40S`, `RTX 4090`, `A100`, `H100` и т.д.) больше не используются даже как fallback — если подходящего `RTX 4080` offer не нашлось, orchestrator завершается ошибкой `No suitable RTX 4080 instance available`, а не расширяет поиск на другую модель (см. [Поиск, фильтрация и рейтинг машин](#поиск-фильтрация-и-рейтинг-машин)). `--gpus` остаётся обычным CLI-параметром (`nargs="+"`) — можно осознанно переопределить его на другую модель/список вручную, но по умолчанию расширения нет.
 
 ## Установка
 
@@ -296,13 +298,14 @@ estimated_cost =
 
 Offers сортируются лексикографически по следующему tuple:
 
-1. **максимальное число NVENC-сессий у GPU** (`core.constants.GPU_NVENC_SESSIONS`, см. [Vast host/offer](#vast-hostoffer)) — карта с двумя-тремя аппаратными энкодерами предпочитается более дешёвой карте с одним, даже если она дороже: ABR-pipeline кодирует 4 rendition параллельно (один decode → GPU-side split, см. [FFmpeg и ABR HLS](#ffmpeg-и-abr-hls)), и на нескольких физических NVENC это даёт реальный, а не времяразделённый параллелизм;
-2. минимальная `estimated_cost` — цена уже только тай-брейкер **внутри** одного NVENC-тира, а не главный критерий;
+1. **максимальное число NVENC-сессий у GPU** (`core.constants.GPU_NVENC_SESSIONS`, см. [Vast host/offer](#vast-hostoffer)) — исторический первый критерий из тех времён, когда allow-list включал несколько моделей разных NVENC-тиров; сейчас allow-list — это только `RTX 4080` (`core.constants.DEFAULT_GPUS`), так что все найденные offers имеют одно и то же значение здесь, и этот пункт tuple не различает их;
+2. минимальная `estimated_cost`;
 3. минимальная почасовая `dph_total`;
-4. максимальная download bandwidth;
-5. максимальная disk bandwidth.
+4. максимальная download bandwidth (`inet_down`) — обязательный минимум 500 Mbps уже задан фильтром поиска, здесь это тай-брейкер в пользу более быстрого канала (1 Gbps+ предпочтительнее);
+5. максимальная upload bandwidth (`inet_up`) — тот же принцип: 500 Mbps гарантирован фильтром, из прошедших фильтр предпочитается более быстрый — именно с upload-канала instance origin потом делает `rsync pull` готового ABR HLS;
+6. максимальная disk bandwidth.
 
-Неизвестная/не перечисленная в `GPU_NVENC_SESSIONS` модель считается однодвижковой (`1`) — консервативно, чтобы не переоценить её. В terminal выводится таблица пяти лучших кандидатов с отдельной колонкой `NVENC`, по которой видно, почему выбран именно этот offer. Для аренды последовательно рассматриваются первые десять: если offer уже занят или вернул `no_compatible_tag`, берётся следующий.
+В terminal выводится таблица пяти лучших кандидатов с отдельной колонкой `NVENC`. Для аренды последовательно рассматриваются первые десять: если offer уже занят или вернул `no_compatible_tag`, берётся следующий — но только среди `RTX 4080`, без расширения на другую модель GPU (см. [Vast host/offer](#vast-hostoffer)).
 
 ## Создание Vast instance
 
@@ -478,9 +481,9 @@ source.mp4
 
 Двухсекундный preflight-тест (см. [Проверка GPU и диска](#проверка-gpu-и-диска)) теперь гоняет тот же `split` + 4× `scale_cuda` + 4× `h264_nvenc`, что и реальный encode — а не одну ветку, как раньше. Если GPU физически не тянет несколько NVENC-сессий сразу, это выяснится за 2 секунды, а не спустя часы реального job.
 
-### GPU allow-list подобран по числу физических NVENC
+### GPU allow-list: только RTX 4080, по прямому бенчмарку
 
-Официальная матрица NVIDIA по encode-сессиям на новых картах: RTX 3060/RTX 3090 — по одному физическому NVENC; RTX 4090/L4/RTX 5080/RTX 5070 Ti — по два; RTX 5090/L40S — по три; A16 — четыре суммарно (это отдельная от предыдущих карта на 4 GPU-кристалла). На одном физическом NVENC четыре encode-сессии всё равно делят одно и то же кодирующее железо по времени, независимо от того, идут ли они как один процесс с `split` или как четыре отдельных — это ограничение железа, не архитектуры кода. Именно поэтому `--gpus` (см. [Vast host/offer](#vast-hostoffer)) и ранжирование offers (см. [Поиск, фильтрация и рейтинг машин](#поиск-фильтрация-и-рейтинг-машин)) теперь явно предпочитают карты с несколькими NVENC: единый decode+split даёт на них настоящий, а не времяразделённый параллелизм между четырьмя rendition. `A100`/`H100`/`B200` не участвуют вообще — у этих чисто compute-карт аппаратного NVENC нет.
+`--gpus`/`core.constants.DEFAULT_GPUS` — только `RTX 4080`, без fallback на другую модель (см. [Vast host/offer](#vast-hostoffer)). Это не оценка по абстрактному числу NVENC-движков, а результат прямого замера именно на этом ABR pipeline (один decode, `split=4`, `preset p3 tune hq`): `RTX 4080` — ≈11.5x realtime при ≈90% NVENC utilization; `L40S` на том же job — только ≈7.8x. `L4`, `L40`, `L40S`, `RTX 4090`, `A100`, `H100` и другие модели больше не рассматриваются автоматически, даже если бы формально прошли остальные фильтры (`GPU_NVENC_SESSIONS`, откуда исторически шло более широкое ранжирование по числу NVENC-движков — см. [Поиск, фильтрация и рейтинг машин](#поиск-фильтрация-и-рейтинг-машин) — остался в коде как факт про железо, но с allow-list из одной модели он больше ничего не решает). Если подходящего `RTX 4080` offer нет, orchestrator завершается ошибкой `No suitable RTX 4080 instance available`, а не расширяет поиск.
 
 ## Прогресс и логи
 
@@ -630,12 +633,14 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--ssh-key` | **обязателен** | Локальный private key для Vast SSH; публичная часть должна быть заранее добавлена в тот же аккаунт Vast.ai, чей `VAST_API_KEY` используется |
 | `--known-hosts` | `/root/.ssh/vast_known_hosts` | Базовое имя ephemeral known-hosts file |
 | `--image` | `progeroffline/vast-transcoder:1.1` | Vast Docker image (переопределяется через `VAST_IMAGE`) |
-| `--disk-gb` | `40` | Размер instance disk |
+| `--disk-gb` | `150` | Размер instance disk; также минимальный `disk_space` в поиске offers |
 | `--max-hourly` | `0.80` | Максимальная цена offer |
 | `--min-reliability` | `0.98` | Минимальная reliability |
 | `--min-cpu` | `4` | Effective CPU cores |
-| `--min-ram-mb` | `8192` | RAM в MB |
-| `--min-disk-bw` | `200` | Disk bandwidth MB/s |
+| `--min-ram-mb` | `16384` | RAM в MB |
+| `--min-disk-bw` | `500` | Disk bandwidth MB/s |
+| `--min-download-mbps` | `500` | Минимальный `inet_down`, Mbps; 1 Gbps+ предпочтительнее (тай-брейкер ранжирования) |
+| `--min-upload-mbps` | `500` | Минимальный `inet_up`, Mbps; 1 Gbps+ предпочтительнее (тай-брейкер ранжирования) |
 | `--expected-hours` | `0.5` | Время только для рейтинга cost |
 | `--boot-timeout` | `600` | Provisioning timeout, seconds |
 | `--job-timeout` | `10800` | Remote job timeout, seconds |
@@ -643,7 +648,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--monitor-interval` | `1.5` | Частота SSH telemetry polling |
 | `--ssh-reconnect-timeout` | `180` | Допустимая длительность SSH outage |
 | `--rsync-retries` | `4` | Число resumable transfer attempts |
-| `--gpus` | см. [Vast host/offer](#vast-hostoffer) | Разрешённые GPU names |
+| `--gpus` | `RTX 4080` (см. [Vast host/offer](#vast-hostoffer)) | Разрешённые GPU names; без явного override — расширения на другую модель нет |
 | `--verbose` | off | DEBUG logging |
 | `--dry-run` | off | Только search/ranking, без аренды |
 
@@ -691,4 +696,4 @@ uv run vast-hls-orchestrator --help
 5. Настройте alert на ошибку DELETE instance: watchdog является дополнительной защитой, а не заменой мониторинга billing.
 6. Контролируйте свободное место origin: remote disk проверяется автоматически, origin disk — ответственность оператора.
 7. Тестируйте HLS playback и nginx MIME types (`application/vnd.apple.mpegurl`, `video/mp2t`) после первого deploy.
-8. Перед изменением bitrate ladder или `GPU_NVENC_SESSIONS` проведите тесты хотя бы на одной карте из каждого NVENC-тира allow-list'а (1/2/3+ сессий).
+8. Перед изменением bitrate ladder или `--gpus` (allow-list сейчас — только `RTX 4080`, выбранная по прямому бенчмарку) прогоните тот же бенчмарк на новой карте/конфигурации, а не полагайтесь на теоретическое число NVENC-движков.

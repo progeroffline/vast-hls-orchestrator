@@ -15,6 +15,7 @@ GPU_NVENC_SESSIONS = {
     "RTX 5090": 3,
     "L40S": 3,
     "RTX 4090": 2,
+    "RTX 4080": 2,
     "L4": 2,
     "RTX 5080": 2,
     "RTX 5070 Ti": 2,
@@ -23,18 +24,14 @@ GPU_NVENC_SESSIONS = {
     "RTX 3090": 1,  # far more CUDA cores than 3060, but the same single NVENC
 }
 
-# Allow-list for offer search: every card with a reasonable NVENC story for
-# ABR transcoding. RTX 3090 and pure-compute cards (A100/H100/B200 -- no
-# NVENC hardware at all) are deliberately excluded.
+# Allow-list for offer search: RTX 4080 only. Benchmarked directly against
+# this project's exact single-process ABR pipeline (1080p+720p+480p+360p,
+# preset p3): ~11.5x realtime at ~90% NVENC utilization, vs. ~7.8x on L40S
+# for the same job -- so no other GPU (L4/L40/L40S/RTX 4090/A100/H100/etc.)
+# is used as a fallback here, even though several of them are still listed
+# in GPU_NVENC_SESSIONS above from when the allow-list was broader.
 DEFAULT_GPUS = [
-    "RTX 5090",
-    "L40S",
-    "RTX 4090",
-    "L4",
-    "RTX 5080",
-    "RTX 5070 Ti",
-    "A16",
-    "RTX 3060",
+    "RTX 4080",
 ]
 
 RENDITIONS = ["1080p", "720p", "480p", "360p"]

@@ -112,6 +112,8 @@ class VastClient:
             "cpu_ram": {"gte": args.min_ram_mb},
             "disk_space": {"gte": args.disk_gb},
             "disk_bw": {"gte": args.min_disk_bw},
+            "inet_down": {"gte": args.min_download_mbps},
+            "inet_up": {"gte": args.min_upload_mbps},
             "direct_port_count": {"gte": 1},
             "cuda_max_good": {"gte": 12.6},
             "dph_total": {"lte": args.max_hourly},

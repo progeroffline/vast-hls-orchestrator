@@ -79,7 +79,12 @@ def choose_offers(
             -gpu_nvenc_sessions(o.get("gpu_name", "")),
             offer_estimated_cost(o, input_gb, args.expected_hours),
             float(o.get("dph_total") or 999),
+            # Both required at a 500 Mbps floor by the search filters already;
+            # among candidates that clear it, still prefer faster (1 Gbps+
+            # is the stated preference) for both directions -- download feeds
+            # the encode, upload is what the origin's rsync pull draws from.
             -float(o.get("inet_down") or 0),
+            -float(o.get("inet_up") or 0),
             -float(o.get("disk_bw") or 0),
         )
     )
@@ -87,9 +92,11 @@ def choose_offers(
     if not offers:
         if len(search_errors) == len(args.gpus):
             raise VastError(f"All offer searches failed: {search_errors[-1]}")
-        raise VastError(
-            "No offers matched the configured price/reliability/disk filters"
-        )
+        # Deliberately no automatic fallback to a different GPU model here --
+        # args.gpus is exactly what was configured to search/rent (RTX 4080
+        # only, by default); if none of it clears the filters, that's a hard
+        # stop, not a cue to broaden the search.
+        raise VastError(f"No suitable {'/'.join(args.gpus)} instance available")
 
     table = Table(
         title="Top Vast.ai candidates", show_lines=False, header_style="bold cyan"
