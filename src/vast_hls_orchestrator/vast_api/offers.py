@@ -1,0 +1,106 @@
+"""Source size probing plus Vast.ai offer cost estimation, ranking and display."""
+
+from __future__ import annotations
+
+import argparse
+
+import requests
+from loguru import logger
+from rich.table import Table
+
+from ..core.console import console
+from ..core.errors import VastAuthError, VastError
+from .client import VastClient
+
+
+def source_size_bytes(url: str) -> int | None:
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=20)
+        r.raise_for_status()
+        n = int(r.headers.get("Content-Length", "0"))
+        return n if n > 0 else None
+    except Exception as exc:
+        logger.debug("Could not determine source size with HEAD: {}", exc)
+        return None
+
+
+def source_size_gb(url: str) -> float:
+    n = source_size_bytes(url)
+    return n / 1_000_000_000 if n else 10.0
+
+
+def offer_estimated_cost(offer: dict, input_gb: float, expected_hours: float) -> float:
+    hourly = float(offer.get("dph_total") or 999)
+    down_cost = float(offer.get("inet_down_cost") or 0)
+    up_cost = float(offer.get("inet_up_cost") or 0)
+    output_gb = input_gb * 1.7
+    return hourly * expected_hours + input_gb * down_cost + output_gb * up_cost
+
+
+def choose_offers(
+    client: VastClient, args: argparse.Namespace, input_gb: float
+) -> list[dict]:
+    offers: list[dict] = []
+    search_errors: list[Exception] = []
+    with console.status("[bold cyan]Searching Vast.ai offers...", spinner="dots"):
+        for gpu in args.gpus:
+            try:
+                found = client.search_offers(gpu, args)
+                logger.info("{}: found {} matching offers", gpu, len(found))
+                offers.extend(found)
+            except VastAuthError:
+                raise
+            except Exception as exc:
+                search_errors.append(exc)
+                logger.warning("Search failed for {}: {}", gpu, exc)
+
+    dedup: dict[int, dict] = {}
+    for offer in offers:
+        try:
+            dedup[int(offer["id"])] = offer
+        except Exception:
+            continue
+
+    offers = list(dedup.values())
+    offers.sort(
+        key=lambda o: (
+            offer_estimated_cost(o, input_gb, args.expected_hours),
+            float(o.get("dph_total") or 999),
+            -float(o.get("inet_down") or 0),
+            -float(o.get("disk_bw") or 0),
+        )
+    )
+
+    if not offers:
+        if len(search_errors) == len(args.gpus):
+            raise VastError(f"All offer searches failed: {search_errors[-1]}")
+        raise VastError(
+            "No offers matched the configured price/reliability/disk filters"
+        )
+
+    table = Table(
+        title="Top Vast.ai candidates", show_lines=False, header_style="bold cyan"
+    )
+    table.add_column("Offer", justify="right")
+    table.add_column("GPU")
+    table.add_column("$/h", justify="right")
+    table.add_column("Reliability", justify="right")
+    table.add_column("Down Mbps", justify="right")
+    table.add_column("Up Mbps", justify="right")
+    table.add_column("Disk MB/s", justify="right")
+    table.add_column("Est. job", justify="right")
+
+    for offer in offers[:5]:
+        est = offer_estimated_cost(offer, input_gb, args.expected_hours)
+        table.add_row(
+            str(offer.get("id", "-")),
+            str(offer.get("gpu_name", "-")),
+            f"{float(offer.get('dph_total') or 0):.4f}",
+            f"{float(offer.get('reliability') or 0):.4f}",
+            f"{float(offer.get('inet_down') or 0):.0f}",
+            f"{float(offer.get('inet_up') or 0):.0f}",
+            f"{float(offer.get('disk_bw') or 0):.0f}",
+            f"${est:.4f}",
+        )
+    console.print(table)
+    return offers

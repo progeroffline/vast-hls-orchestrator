@@ -7,6 +7,7 @@ Production-oriented Python-orchestrator для временного HLS-тран
 ## Навигация
 
 - [Архитектура](#архитектура)
+- [Структура проекта](#структура-проекта)
 - [Полный жизненный цикл job](#полный-жизненный-цикл-job)
 - [Доступы и модель безопасности](#доступы-и-модель-безопасности)
 - [Как получить и настроить доступы](#как-получить-и-настроить-доступы)
@@ -47,7 +48,50 @@ Binary Racks staging → atomic publish /video/<video_id>/abr/
 
 Vast instance никогда не подключается обратно к origin по административному SSH и не получает приватный ключ Binary Racks. Направление передачи результата — **pull с origin**, а не push с Vast.
 
-Основной файл: [`vast_integration.py`](vast_integration.py).
+Пакет: [`src/vast_hls_orchestrator/`](src/vast_hls_orchestrator/) (см. [Структура проекта](#структура-проекта)).
+
+## Структура проекта
+
+Каждый модуль имеет одну ответственность и не превышает 300 строк. Логика сгруппирована по пакетам:
+
+```text
+src/vast_hls_orchestrator/
+├── cli.py                  # argparse: разбор аргументов командной строки
+├── pipeline.py              # оркестрация полного жизненного цикла job (rent → ... → destroy)
+├── __main__.py               # точка входа: parse_args → configure_logging → pipeline.run
+│
+├── core/                      # общие основы, без сетевых/файловых side effects
+│   ├── constants.py             # API endpoints, allow-list GPU, имена renditions
+│   ├── errors.py                 # иерархия исключений (VastError и наследники)
+│   ├── console.py                 # общий Rich Console (stderr)
+│   ├── logging_setup.py            # Loguru → Rich sink
+│   ├── models.py                    # dataclasses: VariantProgress, RemoteSnapshot, DashboardContext
+│   └── validation.py                 # validate_inputs() для CLI-аргументов
+│
+├── vast_api/                  # HTTP-клиент Vast.ai marketplace
+│   ├── client.py                 # VastClient: search/create/show/destroy instance
+│   └── offers.py                  # оценка размера source, ranking и вывод таблицы offers
+│
+├── remote/                    # всё, что выполняется на/через временный Vast instance
+│   ├── job_script.py             # bash-скрипт: download, GPU preflight, параллельный ABR encode
+│   ├── onstart.py                  # bootstrap (`onstart`): watchdog, apt-get, запуск job
+│   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh
+│   └── snapshot.py                   # парсинг FFmpeg `-progress` и nvidia-smi по SSH
+│
+├── ui/                         # Rich-рендеринг
+│   ├── formatting.py              # format_duration/format_bytes/bar
+│   └── dashboard.py                 # четырёхпанельный Live-дашборд
+│
+└── orchestration/              # жизненный цикл instance и результата
+    ├── provisioning.py            # rent_instance, wait_for_running, recover_created_instance
+    ├── job_monitor.py               # wait_for_job: SSH-поллинг + обновление дашборда
+    ├── transfer.py                   # stream_process: live-панель для rsync
+    ├── publish.py                     # atomic_exchange_dirs, rsync_results
+    ├── local_state.py                  # file lock на video_id, recovery прерванного publish
+    └── diagnostics.py                   # tail удалённых логов при сбое
+```
+
+Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень, зависят от всего перечисленного.
 
 ## Полный жизненный цикл job
 
@@ -137,11 +181,12 @@ install -d -m 755 /var/www/html/video
 ### Binary Racks origin
 
 - Linux и Python 3.10+;
+- [uv](https://docs.astral.sh/uv/) для управления зависимостями и запуска;
 - исходящий HTTPS к `console.vast.ai`;
 - исходящий SSH к endpoint, выданному Vast;
 - `rsync` и OpenSSH client;
 - права на `/var/www/html/video`;
-- Python packages: Requests, Rich и Loguru.
+- Python packages (ставятся через uv): Requests, Rich и Loguru.
 
 ### Vast host/offer
 
@@ -165,33 +210,25 @@ install -d -m 755 /var/www/html/video
 
 ## Установка
 
-На Binary Racks, вариант с системными Python packages:
+Проект — полноценный Python-пакет ([`pyproject.toml`](pyproject.toml)), управляемый через [uv](https://docs.astral.sh/uv/). На Binary Racks:
 
 ```bash
 apt-get update
-apt-get install -y \
-  python3 python3-requests python3-rich python3-loguru \
-  rsync openssh-client ca-certificates
+apt-get install -y rsync openssh-client ca-certificates curl
+
+# uv, если ещё не установлен
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 install -d -m 755 /opt/vast-hls-orchestrator
-install -m 755 vast_integration.py /opt/vast-hls-orchestrator/vast_integration.py
+# скопируйте репозиторий (pyproject.toml, uv.lock, src/, README.md) в /opt/vast-hls-orchestrator
+cd /opt/vast-hls-orchestrator
+uv sync --frozen --no-dev
 ```
 
-Вариант с virtualenv:
+`uv sync` создаёт `.venv` рядом с проектом и ставит точные версии из `uv.lock`. Проверить, что пакет собирается и импортируется, перед первым запуском:
 
 ```bash
-apt-get update
-apt-get install -y python3 python3-venv rsync openssh-client ca-certificates
-
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt
-```
-
-Проверьте синтаксис перед первым запуском:
-
-```bash
-python3 -m py_compile vast_integration.py
+uv run python -c "import vast_hls_orchestrator"
 ```
 
 ## Запуск
@@ -201,7 +238,7 @@ python3 -m py_compile vast_integration.py
 ```bash
 export VAST_API_KEY='...'
 
-python3 /root/vast_integration.py \
+uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4
 ```
@@ -209,7 +246,7 @@ python3 /root/vast_integration.py \
 Расширенные диагностические сообщения:
 
 ```bash
-python3 /root/vast_integration.py \
+uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --verbose
@@ -218,7 +255,7 @@ python3 /root/vast_integration.py \
 Только поиск и рейтинг offers, без аренды:
 
 ```bash
-python3 /root/vast_integration.py \
+uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --dry-run
@@ -537,7 +574,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 Полный актуальный список:
 
 ```bash
-python3 vast_integration.py --help
+uv run vast-hls-orchestrator --help
 ```
 
 ## Библиотеки и внешние инструменты
