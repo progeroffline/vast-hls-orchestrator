@@ -195,6 +195,39 @@ class VastClient:
         items = data.get("instances", []) if isinstance(data, dict) else []
         return [item for item in items if isinstance(item, dict)]
 
+    def request_logs(self, instance_id: int, *, tail: str = "1000") -> str | None:
+        """Fetch the instance's own container log tail (no SSH required).
+
+        Vast generates the dump asynchronously and hands back an S3 URL, which
+        may briefly 404 before the upload completes -- callers are expected to
+        poll this periodically and treat a `None` result as "not ready yet".
+        """
+        try:
+            data = self.request(
+                "PUT",
+                f"/instances/request_logs/{instance_id}",
+                body={"tail": tail},
+                timeout=20,
+                retry=False,
+            )
+        except VastError as exc:
+            logger.debug("Could not request instance logs: {}", exc)
+            return None
+        if not isinstance(data, dict) or not data.get("success"):
+            return None
+        result_url = data.get("result_url")
+        if not result_url:
+            return None
+        try:
+            # Deliberately a bare request, not self.s: result_url is a
+            # presigned S3 link and must not receive our Vast API bearer token.
+            r = requests.get(result_url, timeout=20)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as exc:
+            logger.debug("Could not download instance logs from {}: {}", result_url, exc)
+            return None
+
     def destroy_instance(self, instance_id: int) -> None:
         data = self.request("DELETE", f"/instances/{instance_id}/", allow_404=True)
         if data is None:

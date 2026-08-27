@@ -17,6 +17,7 @@ from .orchestration.job_monitor import wait_for_job
 from .orchestration.local_state import acquire_video_lock, recover_local_publish_state
 from .orchestration.provisioning import rent_instance, wait_for_running
 from .orchestration.publish import rsync_results
+from .orchestration.remote_logs import RemoteLogTailer
 from .remote.job_script import build_job_script
 from .remote.onstart import build_onstart
 from .remote.ssh import wait_for_ssh
@@ -106,15 +107,19 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
             client, args, offers, create_label, onstart
         )
 
+        # Vast's own container logs work without SSH, so they're the only window
+        # into what the rented machine is doing until wait_for_ssh succeeds.
+        log_tailer = RemoteLogTailer(client, instance_id, app)
+
         app.set_header_subtitle("provisioning")
         app.set_body(spinner_panel(f"Provisioning instance {instance_id}..."))
-        info = wait_for_running(client, instance_id, args.boot_timeout)
+        info = wait_for_running(client, instance_id, args.boot_timeout, on_poll=log_tailer.poll)
         remote_host = str(info["ssh_host"])
         remote_port = int(info["ssh_port"])
         logger.info("SSH endpoint: root@{}:{}", remote_host, remote_port)
 
         app.set_body(spinner_panel(f"Waiting for SSH on {remote_host}:{remote_port}..."))
-        wait_for_ssh(args, remote_host, remote_port)
+        wait_for_ssh(args, remote_host, remote_port, on_poll=log_tailer.poll)
 
         app.set_header_subtitle("encoding")
         remote_host, remote_port = wait_for_job(

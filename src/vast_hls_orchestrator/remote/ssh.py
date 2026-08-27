@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import time
+from collections.abc import Callable
 
 from loguru import logger
 
@@ -59,10 +60,17 @@ def ssh_run(
 
 
 def wait_for_ssh(
-    args: argparse.Namespace, host: str, port: int, timeout_s: int = 300
+    args: argparse.Namespace,
+    host: str,
+    port: int,
+    timeout_s: int = 300,
+    *,
+    on_poll: Callable[[], None] | None = None,
 ) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if on_poll is not None:
+            on_poll()
         try:
             result = ssh_run(args, host, port, "echo SSH_OK", timeout=15)
             if result.returncode == 0 and "SSH_OK" in result.stdout:

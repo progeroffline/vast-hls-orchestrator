@@ -87,11 +87,12 @@ src/vast_hls_orchestrator/
 │
 └── orchestration/              # жизненный цикл instance и результата
     ├── provisioning.py            # rent_instance, wait_for_running, recover_created_instance
-    ├── job_monitor.py               # wait_for_job: SSH-поллинг + app.set_body(dashboard)
-    ├── transfer.py                   # stream_process: app.set_body(...) для rsync-строки
-    ├── publish.py                     # atomic_exchange_dirs, rsync_results
-    ├── local_state.py                  # file lock на video_id, recovery прерванного publish
-    └── diagnostics.py                   # tail удалённых логов → app.append_log на сбое
+    ├── remote_logs.py               # RemoteLogTailer: container-логи Vast без SSH → Log-панель
+    ├── job_monitor.py                 # wait_for_job: SSH-поллинг + app.set_body(dashboard)
+    ├── transfer.py                     # stream_process: app.set_body(...) для rsync-строки
+    ├── publish.py                       # atomic_exchange_dirs, rsync_results
+    ├── local_state.py                    # file lock на video_id, recovery прерванного publish
+    └── diagnostics.py                     # tail удалённых логов → app.append_log на сбое
 ```
 
 Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень, зависят от всего перечисленного. Ни один низкоуровневый модуль не открывает собственный Rich `Live`/`console.status` — на весь процесс существует ровно один `Live` (`TuiApp`), и все фазы лишь подменяют его `body`.
@@ -448,6 +449,10 @@ ETA        = (duration - out_time) / speed
 3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
 
 Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением.
+
+### Логи самой Vast-машины (до появления SSH)
+
+Пока instance провижинится и пока `wait_for_ssh` ждёт живой SSH (SSH ещё может быть недоступен, например ключ не был вовремя добавлен в аккаунт или прописан не на тот instance), `RemoteLogTailer` (`orchestration/remote_logs.py`) параллельно опрашивает собственный log-эндпоинт Vast.ai — `PUT /api/v0/instances/request_logs/<id>/` — который отдаёт container-логи инстанса **без SSH**. Новые строки дублируются в панель **Log** с префиксом `[vast]`, поэтому видно, что происходит на машине (pull образа, старт контейнера, инициализация sshd), даже если SSH так и не поднимется. Опрос самоограничен (не чаще раза в 5 секунд), чтобы не замедлять цикл ожидания SSH.
 
 ### Loguru и recap после выхода
 

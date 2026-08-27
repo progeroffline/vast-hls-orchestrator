@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 
 from loguru import logger
 
@@ -12,10 +13,18 @@ from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, Vast
 from ..vast_api.client import VastClient
 
 
-def wait_for_running(client: VastClient, instance_id: int, timeout_s: int) -> dict:
+def wait_for_running(
+    client: VastClient,
+    instance_id: int,
+    timeout_s: int,
+    *,
+    on_poll: Callable[[], None] | None = None,
+) -> dict:
     deadline = time.time() + timeout_s
     last = None
     while time.time() < deadline:
+        if on_poll is not None:
+            on_poll()
         info = client.show_instance(instance_id)
         if info is None:
             raise VastError("Instance disappeared while provisioning")
