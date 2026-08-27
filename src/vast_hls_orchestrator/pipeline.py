@@ -15,7 +15,11 @@ from .core.validation import validate_inputs
 from .orchestration.diagnostics import collect_remote_diagnostics
 from .orchestration.job_monitor import wait_for_job
 from .orchestration.local_state import acquire_video_lock, recover_local_publish_state
-from .orchestration.provisioning import rent_instance, wait_for_running
+from .orchestration.provisioning import (
+    ensure_ssh_key_attached,
+    rent_instance,
+    wait_for_running,
+)
 from .orchestration.publish import rsync_results
 from .orchestration.remote_logs import RemoteLogTailer
 from .remote.job_script import build_job_script
@@ -106,6 +110,11 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
         instance_id, selected_offer, create_was_ambiguous = rent_instance(
             client, args, offers, create_label, onstart
         )
+
+        # Account-level key injection doesn't reliably apply to instances
+        # created straight through the API the way it does via the console,
+        # so attach our key to this instance explicitly too.
+        ensure_ssh_key_attached(client, instance_id, args.ssh_key)
 
         # Vast's own container logs work without SSH, so they're the only window
         # into what the rented machine is doing until wait_for_ssh succeeds.

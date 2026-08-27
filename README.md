@@ -86,7 +86,7 @@ src/vast_hls_orchestrator/
 │   └── dashboard.py                   # четырёхпанельный контент body во время encoding
 │
 └── orchestration/              # жизненный цикл instance и результата
-    ├── provisioning.py            # rent_instance, wait_for_running, recover_created_instance
+    ├── provisioning.py            # rent_instance, wait_for_running, ensure_ssh_key_attached
     ├── remote_logs.py               # RemoteLogTailer: container-логи Vast без SSH → Log-панель
     ├── job_monitor.py                 # wait_for_job: SSH-поллинг + app.set_body(dashboard)
     ├── transfer.py                     # stream_process: app.set_body(...) для rsync-строки
@@ -329,6 +329,17 @@ API retries:
 - create PUT никогда вслепую не повторяется после неоднозначного transport/5xx результата;
 - 429 create можно повторить, поскольку сервер явно отклонил запрос по rate limit;
 - исчезновение instance или bad state считается fatal.
+
+### Явный attach SSH-ключа к instance
+
+Аккаунтные SSH-ключи (Console → Keys) по документации Vast.ai должны подставляться в любой новый instance автоматически, но на практике это не всегда надёжно работает для instance, созданных напрямую через API (в отличие от аренды через web-консоль) — именно так проявляется ситуация "через консоль заходит, через API/оркестратор нет" при полностью корректном ключе и аккаунте. Поэтому сразу после успешного create orchestrator дополнительно и явно привязывает ключ к instance:
+
+```http
+POST /api/v0/instances/<instance_id>/ssh
+{"ssh_key": "<публичная часть --ssh-key>"}
+```
+
+Публичная часть берётся из `<--ssh-key>.pub`, а если такого файла нет — извлекается из приватного ключа через `ssh-keygen -y -f <--ssh-key>` (ключ должен быть без passphrase, как и для всех остальных non-interactive SSH-операций). Это best-effort шаг: ошибка здесь только логируется (`WARNING`) и не прерывает pipeline, поскольку аккаунтная инъекция могла сработать и без него.
 
 ## Bootstrap и remote job
 

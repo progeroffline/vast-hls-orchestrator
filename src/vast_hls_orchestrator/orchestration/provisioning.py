@@ -3,14 +3,58 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from loguru import logger
 
 from ..core.constants import BAD_STATES
 from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, VastError
 from ..vast_api.client import VastClient
+
+
+def read_public_key(ssh_key_path: Path) -> str | None:
+    pub_path = Path(f"{ssh_key_path}.pub")
+    try:
+        return pub_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-y", "-f", str(ssh_key_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+
+def ensure_ssh_key_attached(client: VastClient, instance_id: int, ssh_key_path: Path) -> None:
+    """Best-effort: explicitly attach our key to the instance via the API.
+
+    See VastClient.attach_ssh_key for why this is needed in addition to
+    account-level key registration. Failure here is logged, not fatal --
+    account-level injection may still have worked.
+    """
+    public_key = read_public_key(ssh_key_path)
+    if not public_key:
+        logger.warning(
+            "Could not read public key for {} (looked for {}.pub and tried "
+            "ssh-keygen -y); skipping explicit attach-to-instance",
+            ssh_key_path,
+            ssh_key_path,
+        )
+        return
+    try:
+        client.attach_ssh_key(instance_id, public_key)
+        logger.debug("Explicitly attached SSH key to instance {}", instance_id)
+    except VastError as exc:
+        logger.warning("Could not explicitly attach SSH key to instance {}: {}", instance_id, exc)
 
 
 def wait_for_running(

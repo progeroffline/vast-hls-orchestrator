@@ -228,6 +228,26 @@ class VastClient:
             logger.debug("Could not download instance logs from {}: {}", result_url, exc)
             return None
 
+    def attach_ssh_key(self, instance_id: int, public_key: str) -> None:
+        """Explicitly attach a public key to an already-created instance.
+
+        Account-level keys (Console -> Keys) are supposed to be injected into
+        every new instance automatically, but that has been observed to not
+        reliably apply to instances created straight through this API the way
+        it does for instances rented through the web console. This is Vast's
+        own documented way to add a key to a running Docker instance, so it's
+        called unconditionally right after creation as a belt-and-braces step.
+        """
+        data = self.request(
+            "POST",
+            f"/instances/{instance_id}/ssh",
+            body={"ssh_key": public_key},
+            timeout=20,
+            retry=False,
+        )
+        if isinstance(data, dict) and data.get("success") is False:
+            raise VastError(f"Attach SSH key failed for instance {instance_id}: {data}")
+
     def destroy_instance(self, instance_id: int) -> None:
         data = self.request("DELETE", f"/instances/{instance_id}/", allow_404=True)
         if data is None:
