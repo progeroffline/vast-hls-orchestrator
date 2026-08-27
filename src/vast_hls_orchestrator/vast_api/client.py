@@ -195,6 +195,21 @@ class VastClient:
         items = data.get("instances", []) if isinstance(data, dict) else []
         return [item for item in items if isinstance(item, dict)]
 
+    def reboot_instance(self, instance_id: int) -> None:
+        """Stop/start the container in place (same GPU allocation, no re-rent).
+
+        Used for SSH recovery: onstart rewrites /root/.ssh/authorized_keys from
+        scratch on every container start (see remote/onstart.py), so rebooting
+        is how a stale/corrupted authorized_keys gets reset when there is no
+        SSH session yet to fix it by hand.
+        """
+        data = self.request("PUT", f"/instances/reboot/{instance_id}/", allow_404=True)
+        if data is None:
+            raise VastError(f"Cannot reboot instance {instance_id}: instance not found")
+        if isinstance(data, dict) and data.get("success") is False:
+            raise VastError(f"Reboot failed for instance {instance_id}: {data}")
+        logger.info("Reboot requested for Vast instance {}", instance_id)
+
     def destroy_instance(self, instance_id: int) -> None:
         data = self.request("DELETE", f"/instances/{instance_id}/", allow_404=True)
         if data is None:

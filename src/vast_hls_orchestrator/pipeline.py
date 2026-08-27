@@ -15,11 +15,15 @@ from .core.validation import validate_inputs
 from .orchestration.diagnostics import collect_remote_diagnostics
 from .orchestration.job_monitor import wait_for_job
 from .orchestration.local_state import acquire_video_lock, recover_local_publish_state
-from .orchestration.provisioning import read_public_key, rent_instance, wait_for_running
+from .orchestration.provisioning import (
+    read_public_key,
+    rent_instance,
+    wait_for_running,
+    wait_for_ssh_with_recovery,
+)
 from .orchestration.publish import rsync_results
 from .remote.job_script import build_job_script
 from .remote.onstart import build_onstart
-from .remote.ssh import wait_for_ssh
 from .ui.formatting import format_cost, format_duration
 from .vast_api.client import VastClient
 from .vast_api.offers import choose_offers, source_size_bytes
@@ -116,7 +120,9 @@ def run(args: argparse.Namespace) -> int:
         remote_port = int(info["ssh_port"])
         logger.info("SSH endpoint: root@{}:{}", remote_host, remote_port)
 
-        wait_for_ssh(args, remote_host, remote_port)
+        remote_host, remote_port = wait_for_ssh_with_recovery(
+            args, client, instance_id, remote_host, remote_port
+        )
         remote_host, remote_port = wait_for_job(
             args,
             client,

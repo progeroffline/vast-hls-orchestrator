@@ -99,7 +99,7 @@ src/vast_hls_orchestrator/
 4. Запрашивает у Vast.ai подходящие offers по allow-list GPU (RTX 5090, L40S, RTX 4090, L4, RTX 5080, RTX 5070 Ti, A16, RTX 3060).
 5. Объединяет, дедуплицирует и ранжирует offers по ожидаемой полной стоимости job.
 6. Принимает лучший доступный offer через Vast API и получает `instance_id`.
-7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint.
+7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint; если SSH так и не поднялся, делает `reboot` инстанса (это заново прогоняет `onstart` и пересобирает `authorized_keys` с нуля) и повторяет ожидание — до нескольких таких циклов подряд, прежде чем считать job проваленным (см. [SSH-ключ пишется в контейнер напрямую](#ssh-ключ-пишется-в-контейнер-напрямую-а-не-через-аккаунтную-инъекцию-vast)).
 8. Vast выполняет переданный `onstart`: запускает watchdog, устанавливает пакеты и стартует remote encode job.
 9. Origin через SSH опрашивает stage, download size, GPU telemetry, progress-файлы и tails логов.
 10. Remote job скачивает source, проверяет диск и GPU pipeline, затем одним FFmpeg-процессом (общий decode, GPU-side split) кодирует все четыре rendition.
@@ -335,12 +335,23 @@ API retries:
 
 ```bash
 mkdir -p /root/.ssh && chmod 700 /root/.ssh
-touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-grep -qxF "<публичная часть --ssh-key>" /root/.ssh/authorized_keys || \
-  printf '%s\n' "<публичная часть --ssh-key>" >> /root/.ssh/authorized_keys
+printf '%s\n' "<публичная часть --ssh-key>" > /root/.ssh/authorized_keys.new
+chmod 600 /root/.ssh/authorized_keys.new
+mv -f /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys
 ```
 
-`grep -qxF` перед добавлением делает это идемпотентным (повторный запуск/перезапуск bootstrap не задублирует строку). Публичная часть берётся из `<--ssh-key>.pub`, а если такого файла нет — извлекается из приватного ключа через `ssh-keygen -y -f <--ssh-key>` (ключ должен быть без passphrase, как и для всех остальных non-interactive SSH-операций); без публичного ключа orchestrator не арендует instance вообще. Это единственный и достаточный механизм — никаких дополнительных вызовов Vast API для привязки/проверки ключа нет.
+Файл каждый раз пересобирается с нуля (truncate + atomic `mv`), а не дополняется по `grep -qxF`: это делает шаг идемпотентным точно так же, как и append-if-missing, но вдобавок автоматически лечит любой сторонний/повреждённый `authorized_keys` при следующем старте контейнера — что и используется SSH-recovery (см. ниже). Публичная часть берётся из `<--ssh-key>.pub`, а если такого файла нет — извлекается из приватного ключа через `ssh-keygen -y -f <--ssh-key>` (ключ должен быть без passphrase, как и для всех остальных non-interactive SSH-операций); без публичного ключа orchestrator не арендует instance вообще. Никаких дополнительных вызовов Vast API для привязки/проверки ключа нет.
+
+### SSH-recovery: reboot instance, если SSH не поднялся
+
+Если после появления SSH endpoint (`wait_for_running`) вход по SSH не проходит в течение окна ожидания (`orchestration/provisioning.wait_for_ssh_with_recovery`), orchestrator не сдаётся сразу, а:
+
+1. вызывает `PUT /api/v0/instances/reboot/<id>/` — стоп/старт того же контейнера без потери GPU-аренды (в отличие от destroy/re-rent);
+2. это заново прогоняет `onstart`, а значит и переписанный с нуля блок записи ключа выше — эффективно "убрать и заново добавить" сам ключ, без необходимости SSH-сессии, чтобы сделать это вручную;
+3. заново ждёт `actual_status=running` (`wait_for_running`), затем сбрасывает локальный `known_hosts` для этого job — свежий старт контейнера может пересоздать host key sshd, а `StrictHostKeyChecking=accept-new` доверяет только *новому* хосту и откажет, если для уже записанного хоста ключ поменялся;
+4. снова ждёт SSH какое-то время.
+
+Цикл повторяется до нескольких раз подряд; если SSH так и не поднялся — job завершается ошибкой с диагностикой. Поскольку Vast reboot API не принимает параметров, каждый reboot заново гоняет тот же самый `onstart` — двух reboot подряд («убрать / перезапустить / добавить / перезапустить» как раздельные шаги) не требуется: перезапись ключа с нуля уже происходит атомарно при каждом отдельном reboot.
 
 ## Bootstrap и remote job
 
@@ -587,6 +598,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 - неоднозначный create response;
 - provisioning timeout и исчезновение instance;
 - позднее появление/изменение SSH endpoint;
+- SSH так и не поднялся после старта instance (reboot + повторная попытка, до нескольких циклов);
 - кратковременные SSH disconnects;
 - aria2/source failure;
 - недостаток remote disk space;
@@ -650,6 +662,7 @@ uv run vast-hls-orchestrator --help
 - [Create instance](https://docs.vast.ai/api-reference/instances/create-instance) — принятие offer.
 - [Show instance](https://docs.vast.ai/api-reference/instances/show-instance) — provisioning/endpoint state.
 - [Show instances v1](https://docs.vast.ai/api-reference/instances/show-instances) — reconciliation по label.
+- [Reboot instance](https://docs.vast.ai/api-reference/instances/reboot-instance) — stop/start контейнера на месте; используется SSH-recovery для повторного прогона `onstart`.
 - [Destroy instance](https://docs.vast.ai/api-reference/instances/destroy-instance) — окончательное удаление.
 - [Vast Docker environment](https://docs.vast.ai/guides/instances/docker-environment) — `CONTAINER_API_KEY` и `CONTAINER_ID`.
 - [FFmpeg](https://ffmpeg.org/documentation.html) — ffprobe, NVDEC, CUDA filters, NVENC и HLS muxer.

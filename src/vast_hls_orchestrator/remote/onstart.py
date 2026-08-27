@@ -16,11 +16,17 @@ def build_onstart(job_script: str, failsafe_seconds: int, authorized_key: str) -
     # inside the container, is a guarantee that doesn't depend on Vast's own
     # bookkeeping being in sync with reality. Done first, before anything else
     # that could fail or take a while.
+    # Rebuilt from scratch -- truncate + rewrite, not append-if-missing -- on
+    # every container start, including a recovery reboot (see
+    # orchestration/provisioning.wait_for_ssh_with_recovery). That makes a
+    # plain reboot enough to clear a stale/corrupted authorized_keys and put
+    # back exactly the one key that's supposed to be there, with no SSH
+    # session required to do it by hand.
     key_setup = f"""mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-touch /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-grep -qxF {quoted_key} /root/.ssh/authorized_keys || printf '%s\n' {quoted_key} >> /root/.ssh/authorized_keys
+printf '%s\n' {quoted_key} > /root/.ssh/authorized_keys.new
+chmod 600 /root/.ssh/authorized_keys.new
+mv -f /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys
 """
     bootstrap = f"""#!/usr/bin/env bash
 set -Eeuo pipefail

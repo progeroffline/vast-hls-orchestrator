@@ -13,7 +13,16 @@ from rich.markup import escape
 from ..core.console import console
 from ..core.constants import BAD_STATES
 from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, VastError
+from ..remote.ssh import wait_for_ssh
 from ..vast_api.client import VastClient
+
+# How long a single SSH-readiness poll window lasts, how many full
+# reboot-and-retry cycles to attempt before giving up, and how long to pause
+# after a reboot (before the container is even back to "running") before
+# polling SSH again.
+SSH_ATTEMPT_TIMEOUT_S = 180
+SSH_RECOVERY_ATTEMPTS = 3
+SSH_REBOOT_SETTLE_S = 15
 
 
 def read_public_key(ssh_key_path: Path) -> str | None:
@@ -59,6 +68,64 @@ def wait_for_running(client: VastClient, instance_id: int, timeout_s: int) -> di
                 raise VastError(f"Instance entered terminal/bad state: {state}")
             time.sleep(5)
     raise VastError("Timed out waiting for Vast instance to become running")
+
+
+def _reset_known_hosts(args: argparse.Namespace) -> None:
+    # A reboot restarts the container fresh and can regenerate its sshd host
+    # key. StrictHostKeyChecking=accept-new only auto-trusts a host it has
+    # *no* record of -- it refuses a *changed* key for one already recorded
+    # here, so a pre-reboot entry would otherwise lock us out permanently
+    # instead of letting the retry through.
+    try:
+        args.known_hosts.write_text("", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not reset known_hosts before SSH retry: {}", exc)
+
+
+def wait_for_ssh_with_recovery(
+    args: argparse.Namespace,
+    client: VastClient,
+    instance_id: int,
+    host: str,
+    port: int,
+) -> tuple[str, int]:
+    """Wait for SSH; if it never comes up, reboot the instance and retry.
+
+    onstart rewrites /root/.ssh/authorized_keys from scratch on every
+    container start (see remote/onstart.py), so a reboot is the reset used
+    here -- there is no SSH session yet to fix authorized_keys by hand.
+    Vast's reboot API takes no parameters, so it always re-runs the exact
+    onstart the instance was created with; one reboot per cycle already gets
+    a freshly-written authorized_keys, doing it twice in a row wouldn't
+    change the outcome.
+    """
+    last_error: VastError | None = None
+    for attempt in range(1, SSH_RECOVERY_ATTEMPTS + 1):
+        try:
+            wait_for_ssh(args, host, port, timeout_s=SSH_ATTEMPT_TIMEOUT_S)
+            return host, port
+        except VastError as exc:
+            last_error = exc
+            if attempt == SSH_RECOVERY_ATTEMPTS:
+                break
+            logger.warning(
+                "SSH not reachable after {}s (attempt {}/{}); rebooting instance {} "
+                "to reset authorized_keys and retrying",
+                SSH_ATTEMPT_TIMEOUT_S,
+                attempt,
+                SSH_RECOVERY_ATTEMPTS,
+                instance_id,
+            )
+            client.reboot_instance(instance_id)
+            info = wait_for_running(client, instance_id, args.boot_timeout)
+            host = str(info["ssh_host"])
+            port = int(info["ssh_port"])
+            _reset_known_hosts(args)
+            time.sleep(SSH_REBOOT_SETTLE_S)
+    raise VastError(
+        f"SSH never became reachable after {SSH_RECOVERY_ATTEMPTS} reboot-and-retry "
+        f"cycles: {last_error}"
+    )
 
 
 def recover_created_instance(
