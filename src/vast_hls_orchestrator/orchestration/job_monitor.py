@@ -37,6 +37,12 @@ def _log_progress(ctx: JobContext, snap: RemoteSnapshot) -> None:
         parts.append(f"fps={snap.encode.fps:.1f}")
     if snap.encode.speed:
         parts.append(f"speed={snap.encode.speed:.2f}x")
+    if snap.duration_seconds > 0 and snap.encode.speed > 0:
+        # All four renditions share one decode/encode pass, so one ETA
+        # covers the whole ABR ladder -- they finish together.
+        remaining_media = snap.duration_seconds - snap.encode.out_time_seconds
+        eta_seconds = max(0.0, remaining_media) / snap.encode.speed
+        parts.append(f"eta={format_duration(eta_seconds)}")
     parts.append(f"cost={format_cost(ctx.hourly_price, elapsed)}")
     logger.info("Progress: {}", "  ".join(parts))
 
@@ -146,7 +152,8 @@ def wait_for_job(
                     host,
                     port,
                     "echo '=== job.log ==='; tail -n 200 /workspace/job.log || true; "
-                    "echo '=== ffmpeg.log ==='; tail -n 200 /workspace/out/ffmpeg.log 2>/dev/null || true",
+                    "echo '=== ffmpeg.log ==='; "
+                    "grep -v \"Opening '.*\\.ts' for writing\" /workspace/out/ffmpeg.log 2>/dev/null | tail -n 200 || true",
                     timeout=40,
                 )
                 raise VastError(

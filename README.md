@@ -430,7 +430,7 @@ source.mp4
 
 - один `-hwaccel cuda -hwaccel_output_format cuda` decode на весь job;
 - `[0:v]split=4[...]`, затем `scale_cuda` на каждую ветку — CUDA-фреймы никогда не возвращаются в system RAM;
-- `h264_nvenc`, preset `p5`, tune `hq`, rate control `vbr`, свой `-cq`/битрейт/аудио на каждый output;
+- `h264_nvenc`, preset `p3`, tune `hq`, rate control `vbr`, свой `-cq`/битрейт/аудио на каждый output;
 - forced keyframe/IDR каждые 6 секунд — на каждый output отдельно, без stream-index суффиксов (`-force_key_frames`/`-forced-idr` позиционно scoped на "текущий" output, что явно проверено — суффикс `:N` для этого не нужен и не всегда предсказуем);
 - HLS VOD, `hls_time=6`, `independent_segments`;
 - optional первый audio stream, замаплен в каждый output отдельно (`0:a:0?`);

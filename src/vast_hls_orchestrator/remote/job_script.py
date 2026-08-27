@@ -45,7 +45,7 @@ def _preflight_filter() -> str:
 
 def _preflight_maps() -> str:
     return " \\\n  ".join(
-        f'-map "[q{name}]" -c:v h264_nvenc -preset p5 -tune hq' for name, *_ in LADDER
+        f'-map "[q{name}]" -c:v h264_nvenc -preset p3 -tune hq' for name, *_ in LADDER
     )
 
 
@@ -55,7 +55,7 @@ def _encode_outputs(out_dir: str, fifo: str) -> str:
     for i, (name, _size, bitrate, maxrate, bufsize, audio, cq) in enumerate(LADDER):
         progress = f' \\\n    -progress "{fifo}"' if i == last_index else ""
         blocks.append(
-            f'-map "[s{name}]" -map "0:a:0?" -c:v h264_nvenc -preset p5 -tune hq '
+            f'-map "[s{name}]" -map "0:a:0?" -c:v h264_nvenc -preset p3 -tune hq '
             f"-rc vbr -cq {cq} \\\n"
             f"    -b:v {bitrate} -maxrate {maxrate} -bufsize {bufsize} \\\n"
             f"    -force_key_frames 'expr:gte(t,n_forced*6)' -forced-idr 1 \\\n"

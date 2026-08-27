@@ -16,7 +16,8 @@ def collect_remote_diagnostics(args: argparse.Namespace, host: str, port: int) -
     command = (
         "echo '=== bootstrap.log ==='; tail -n 120 /workspace/bootstrap.log 2>/dev/null || true; "
         "echo '=== job.log ==='; tail -n 200 /workspace/job.log 2>/dev/null || true; "
-        "echo '=== ffmpeg.log ==='; tail -n 200 /workspace/out/ffmpeg.log 2>/dev/null || true"
+        "echo '=== ffmpeg.log ==='; "
+        "grep -v \"Opening '.*\\.ts' for writing\" /workspace/out/ffmpeg.log 2>/dev/null | tail -n 200 || true"
     )
     try:
         result = ssh_run(args, host, port, command, timeout=25)
