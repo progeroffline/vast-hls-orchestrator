@@ -64,13 +64,14 @@ src/vast_hls_orchestrator/
 │   ├── constants.py             # API endpoints, allow-list GPU, имена renditions
 │   ├── errors.py                 # иерархия исключений (VastError и наследники)
 │   ├── console.py                 # общий Rich Console (stderr)
-│   ├── logging_setup.py            # Loguru → Rich sink
-│   ├── models.py                    # dataclasses: VariantProgress, RemoteSnapshot, DashboardContext
-│   └── validation.py                 # validate_inputs() для CLI-аргументов
+│   ├── logging_setup.py            # Loguru → Rich sink / панель Log активного TUI
+│   ├── tui_state.py                 # registry активного TuiApp (без зависимости core → ui)
+│   ├── models.py                     # dataclasses: VariantProgress, RemoteSnapshot, DashboardContext
+│   └── validation.py                  # validate_inputs() для CLI-аргументов
 │
 ├── vast_api/                  # HTTP-клиент Vast.ai marketplace
 │   ├── client.py                 # VastClient: search/create/show/destroy instance
-│   └── offers.py                  # оценка размера source, ranking и вывод таблицы offers
+│   └── offers.py                  # оценка размера source, ranking, таблица offers (без вывода)
 │
 ├── remote/                    # всё, что выполняется на/через временный Vast instance
 │   ├── job_script.py             # bash-скрипт: download, GPU preflight, параллельный ABR encode
@@ -78,20 +79,22 @@ src/vast_hls_orchestrator/
 │   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh
 │   └── snapshot.py                   # парсинг FFmpeg `-progress` и nvidia-smi по SSH
 │
-├── ui/                         # Rich-рендеринг
-│   ├── formatting.py              # format_duration/format_bytes/bar
-│   └── dashboard.py                 # четырёхпанельный Live-дашборд
+├── ui/                         # единое full-screen TUI-приложение (Rich)
+│   ├── app.py                    # TuiApp: постоянный alternate-screen Live, header/body/log
+│   ├── phases.py                   # spinner/summary панели для фаз без своего дашборда
+│   ├── formatting.py                # format_duration/format_bytes/bar
+│   └── dashboard.py                   # четырёхпанельный контент body во время encoding
 │
 └── orchestration/              # жизненный цикл instance и результата
     ├── provisioning.py            # rent_instance, wait_for_running, recover_created_instance
-    ├── job_monitor.py               # wait_for_job: SSH-поллинг + обновление дашборда
-    ├── transfer.py                   # stream_process: live-панель для rsync
+    ├── job_monitor.py               # wait_for_job: SSH-поллинг + app.set_body(dashboard)
+    ├── transfer.py                   # stream_process: app.set_body(...) для rsync-строки
     ├── publish.py                     # atomic_exchange_dirs, rsync_results
     ├── local_state.py                  # file lock на video_id, recovery прерванного publish
-    └── diagnostics.py                   # tail удалённых логов при сбое
+    └── diagnostics.py                   # tail удалённых логов → app.append_log на сбое
 ```
 
-Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень, зависят от всего перечисленного.
+Зависимости идут в одну сторону: `core` ни от чего не зависит; `vast_api`, `remote`, `ui` зависят только от `core`; `orchestration` зависит от `core`/`vast_api`/`remote`/`ui`; `pipeline.py` и `cli.py` — самый верхний уровень, зависят от всего перечисленного. Ни один низкоуровневый модуль не открывает собственный Rich `Live`/`console.status` — на весь процесс существует ровно один `Live` (`TuiApp`), и все фазы лишь подменяют его `body`.
 
 ## Полный жизненный цикл job
 
@@ -428,26 +431,27 @@ percentage = out_time / ffprobe_duration × 100
 ETA        = (duration - out_time) / speed
 ```
 
-### Rich dashboard
+### Полноэкранное приложение
 
-[Rich](https://rich.readthedocs.io/) создаёт Live UI из четырёх панелей:
+Весь запуск, от разбора аргументов до `finally` с destroy instance, рендерится как одно [Rich](https://rich.readthedocs.io/) full-screen приложение (`ui/app.py`, alternate screen buffer — как у `htop`/`vim`), а не серия отдельных Live-виджетов. Экран разбит на три зоны:
 
-1. **Vast.ai encoder** — stage, instance ID, GPU, цена, elapsed и SSH endpoint;
-2. **Resources** — download progress, GPU/NVENC/NVDEC utilization и VRAM;
-3. **ABR encode** — строка на 1080p/720p/480p/360p с progress bar, media time, percentage, FPS, speed и ETA;
-4. **Remote log tail** — последние строки bootstrap/job log.
+1. **Header** — название и текущая фаза (`searching offers`, `provisioning`, `encoding`, `transferring result`, `done`/`failed`);
+2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/SSH, download+GPU/NVENC/NVDEC/VRAM, progress по 1080p/720p/480p/360p, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
+3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
 
-Во время rsync основной dashboard уже закрыт, а отдельная Rich Live panel показывает текущую строку `rsync --info=progress2` без заполнения terminal тысячами carriage-return строк.
+Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением.
 
-### Loguru
+### Loguru и recap после выхода
 
-[Loguru](https://loguru.readthedocs.io/) направляется в собственный Rich-compatible sink:
+[Loguru](https://loguru.readthedocs.io/) направляется в собственный sink:
 
 - `INFO` — stages, выбранный offer, endpoint, transfer lifecycle;
 - `SUCCESS` — SSH ready, encode complete, publish и destroy;
 - `WARNING` — transient API/SSH/rsync failures, fallback и recovery;
 - `ERROR` — понятная причина окончательного сбоя;
 - `DEBUG` — API attempts, remote commands и дополнительные remote log changes; включается `--verbose`.
+
+Пока полноэкранное приложение активно, все log-записи идут в панель **Log**, а не печатаются напрямую в терминал. Alternate screen buffer терминала стирается в момент выхода из приложения, поэтому сразу после закрытия full-screen режима оркестратор печатает весь накопленный лог обратно в обычный scrollback терминала (`TuiApp.print_recap()`) — это единственная информация, которая у оператора остаётся после завершения job, включая diagnostics при сбое (tail bootstrap/job/ffmpeg логов).
 
 API keys и private key contents не логируются.
 
@@ -511,10 +515,10 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 
 При первом Ctrl+C:
 
-1. Rich Live context закрывается;
-2. активный rsync получает terminate, затем kill при необходимости;
-3. управление переходит в Python `finally`;
-4. Vast instance удаляется;
+1. активный rsync получает terminate, затем kill при необходимости;
+2. управление переходит в `except KeyboardInterrupt` / Python `finally` внутри полноэкранного приложения;
+3. Vast instance удаляется;
+4. full-screen приложение закрывается (alternate screen restore) и лог реплеится в обычный терминал;
 5. процесс возвращает exit code `130`.
 
 ### Диагностика ошибок

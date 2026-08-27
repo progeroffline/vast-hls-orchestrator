@@ -1,4 +1,4 @@
-"""Source size probing plus Vast.ai offer cost estimation, ranking and display."""
+"""Source size probing plus Vast.ai offer cost estimation, ranking and a display table."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import requests
 from loguru import logger
 from rich.table import Table
 
-from ..core.console import console
 from ..core.errors import VastAuthError, VastError
 from .client import VastClient
 
@@ -42,17 +41,16 @@ def choose_offers(
 ) -> list[dict]:
     offers: list[dict] = []
     search_errors: list[Exception] = []
-    with console.status("[bold cyan]Searching Vast.ai offers...", spinner="dots"):
-        for gpu in args.gpus:
-            try:
-                found = client.search_offers(gpu, args)
-                logger.info("{}: found {} matching offers", gpu, len(found))
-                offers.extend(found)
-            except VastAuthError:
-                raise
-            except Exception as exc:
-                search_errors.append(exc)
-                logger.warning("Search failed for {}: {}", gpu, exc)
+    for gpu in args.gpus:
+        try:
+            found = client.search_offers(gpu, args)
+            logger.info("{}: found {} matching offers", gpu, len(found))
+            offers.extend(found)
+        except VastAuthError:
+            raise
+        except Exception as exc:
+            search_errors.append(exc)
+            logger.warning("Search failed for {}: {}", gpu, exc)
 
     dedup: dict[int, dict] = {}
     for offer in offers:
@@ -77,7 +75,10 @@ def choose_offers(
         raise VastError(
             "No offers matched the configured price/reliability/disk filters"
         )
+    return offers
 
+
+def render_offers_table(offers: list[dict], input_gb: float, expected_hours: float) -> Table:
     table = Table(
         title="Top Vast.ai candidates", show_lines=False, header_style="bold cyan"
     )
@@ -91,7 +92,7 @@ def choose_offers(
     table.add_column("Est. job", justify="right")
 
     for offer in offers[:5]:
-        est = offer_estimated_cost(offer, input_gb, args.expected_hours)
+        est = offer_estimated_cost(offer, input_gb, expected_hours)
         table.add_row(
             str(offer.get("id", "-")),
             str(offer.get("gpu_name", "-")),
@@ -102,5 +103,4 @@ def choose_offers(
             f"{float(offer.get('disk_bw') or 0):.0f}",
             f"${est:.4f}",
         )
-    console.print(table)
-    return offers
+    return table

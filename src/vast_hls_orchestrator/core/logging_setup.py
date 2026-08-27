@@ -1,4 +1,6 @@
-"""Loguru configuration that renders log records through the shared Rich console."""
+"""Loguru configuration: renders log records to the console, or into the
+active full-screen TUI app's log panel when one is running.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +9,7 @@ from typing import Any
 from loguru import logger
 from rich.markup import escape
 
+from . import tui_state
 from .console import console
 
 
@@ -27,12 +30,15 @@ class RichLogSink:
         timestamp = record["time"].strftime("%H:%M:%S")
         level = record["level"].name.ljust(7)
         text = escape(record["message"])
-        console.print(
-            f"[dim]{timestamp}[/] [{style}]{level}[/] {text}",
-            highlight=False,
-        )
+        line = f"[dim]{timestamp}[/] [{style}]{level}[/] {text}"
         if record.get("exception"):
-            console.print(str(record["exception"]), style="red")
+            line += "\n" + escape(str(record["exception"]))
+
+        app = tui_state.active()
+        if app is not None:
+            app.append_log(line)
+        else:
+            console.print(line, highlight=False)
 
 
 def configure_logging(verbose: bool = False) -> None:

@@ -8,7 +8,6 @@ import time
 
 from loguru import logger
 
-from ..core.console import console
 from ..core.errors import VastError
 
 
@@ -63,16 +62,13 @@ def wait_for_ssh(
     args: argparse.Namespace, host: str, port: int, timeout_s: int = 300
 ) -> None:
     deadline = time.time() + timeout_s
-    with console.status(
-        f"[bold cyan]Waiting for SSH on {host}:{port}...", spinner="dots"
-    ):
-        while time.time() < deadline:
-            try:
-                result = ssh_run(args, host, port, "echo SSH_OK", timeout=15)
-                if result.returncode == 0 and "SSH_OK" in result.stdout:
-                    logger.success("SSH is ready")
-                    return
-            except Exception:
-                pass
-            time.sleep(3)
+    while time.time() < deadline:
+        try:
+            result = ssh_run(args, host, port, "echo SSH_OK", timeout=15)
+            if result.returncode == 0 and "SSH_OK" in result.stdout:
+                logger.success("SSH is ready")
+                return
+        except Exception:
+            pass
+        time.sleep(3)
     raise VastError("SSH did not become ready")

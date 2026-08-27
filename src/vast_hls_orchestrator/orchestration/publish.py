@@ -15,6 +15,7 @@ from loguru import logger
 
 from ..core.constants import RENDITIONS
 from ..core.errors import VastError
+from ..ui.app import TuiApp
 from .transfer import stream_process
 
 
@@ -48,7 +49,7 @@ def atomic_exchange_dirs(left: Path, right: Path) -> bool:
 
 
 def rsync_results(
-    args: argparse.Namespace, host: str, port: int, instance_id: int
+    args: argparse.Namespace, host: str, port: int, instance_id: int, app: TuiApp
 ) -> Path:
     dest = args.origin_root / args.video_id / "abr"
     staging = args.origin_root / args.video_id / f"abr.staging.{instance_id}"
@@ -102,6 +103,7 @@ def rsync_results(
                     "Pulling encoded HLS from Vast.ai to Binary Racks... "
                     f"(attempt {attempt}/{args.rsync_retries})"
                 ),
+                app=app,
             )
             last_error = None
             break

@@ -1,19 +1,18 @@
-"""Fetches remote log tails for display when the pipeline fails."""
+"""Fetches remote log tails and appends them to the TUI app's log buffer on failure."""
 
 from __future__ import annotations
 
 import argparse
 
 from loguru import logger
-from rich.panel import Panel
-from rich.text import Text
+from rich.markup import escape
 
-from ..core.console import console
 from ..remote.ssh import ssh_run
+from ..ui.app import TuiApp
 
 
 def collect_remote_diagnostics(
-    args: argparse.Namespace, host: str, port: int
+    args: argparse.Namespace, host: str, port: int, app: TuiApp
 ) -> None:
     command = (
         "echo '=== bootstrap.log ==='; tail -n 120 /workspace/bootstrap.log 2>/dev/null || true; "
@@ -25,7 +24,9 @@ def collect_remote_diagnostics(
         result = ssh_run(args, host, port, command, timeout=25)
         output = result.stdout.strip()
         if output:
-            console.print(Panel(Text(output), title="Remote failure diagnostics", border_style="red"))
+            app.append_log("[bold red]--- Remote failure diagnostics ---[/]")
+            for line in output.splitlines():
+                app.append_log(escape(line))
         elif result.stderr.strip():
             logger.warning("Could not retrieve remote diagnostics: {}", result.stderr.strip())
     except Exception as exc:

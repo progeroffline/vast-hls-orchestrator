@@ -6,9 +6,7 @@ import argparse
 import time
 
 from loguru import logger
-from rich.markup import escape
 
-from ..core.console import console
 from ..core.constants import BAD_STATES
 from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, VastError
 from ..vast_api.client import VastClient
@@ -17,26 +15,20 @@ from ..vast_api.client import VastClient
 def wait_for_running(client: VastClient, instance_id: int, timeout_s: int) -> dict:
     deadline = time.time() + timeout_s
     last = None
-    with console.status(
-        f"[bold cyan]Provisioning Vast instance {instance_id}...", spinner="dots"
-    ) as status:
-        while time.time() < deadline:
-            info = client.show_instance(instance_id)
-            if info is None:
-                raise VastError("Instance disappeared while provisioning")
-            state = info.get("actual_status")
-            msg = info.get("status_msg") or ""
-            status.update(
-                f"[bold cyan]Instance {instance_id}: {state}[/] [dim]{escape(str(msg))}[/]"
-            )
-            if state != last:
-                logger.info("Instance state: {}{}", state, f"; {msg}" if msg else "")
-                last = state
-            if state == "running" and info.get("ssh_host") and info.get("ssh_port"):
-                return info
-            if state in BAD_STATES:
-                raise VastError(f"Instance entered terminal/bad state: {state}")
-            time.sleep(5)
+    while time.time() < deadline:
+        info = client.show_instance(instance_id)
+        if info is None:
+            raise VastError("Instance disappeared while provisioning")
+        state = info.get("actual_status")
+        msg = info.get("status_msg") or ""
+        if state != last:
+            logger.info("Instance state: {}{}", state, f"; {msg}" if msg else "")
+            last = state
+        if state == "running" and info.get("ssh_host") and info.get("ssh_port"):
+            return info
+        if state in BAD_STATES:
+            raise VastError(f"Instance entered terminal/bad state: {state}")
+        time.sleep(5)
     raise VastError("Timed out waiting for Vast instance to become running")
 
 
