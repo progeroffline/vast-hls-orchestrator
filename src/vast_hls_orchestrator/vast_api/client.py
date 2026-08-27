@@ -237,6 +237,12 @@ class VastClient:
         it does for instances rented through the web console. This is Vast's
         own documented way to add a key to a running Docker instance, so it's
         called unconditionally right after creation as a belt-and-braces step.
+
+        A `success: false` / "already associated" response here does NOT mean
+        our specific key is the one present -- it can mean a *different* key
+        was already auto-injected at creation and ours was rejected as
+        redundant. Callers must confirm with `list_ssh_keys`, not trust this
+        call's response alone.
         """
         data = self.request(
             "POST",
@@ -247,6 +253,20 @@ class VastClient:
         )
         if isinstance(data, dict) and data.get("success") is False:
             raise VastError(f"Attach SSH key failed for instance {instance_id}: {data}")
+
+    def list_ssh_keys(self, instance_id: int) -> list[dict]:
+        """List the SSH keys actually attached to an instance right now."""
+        data = self.request("GET", f"/instances/{instance_id}/ssh", timeout=20)
+        if not isinstance(data, dict) or not data.get("success"):
+            return []
+        raw = data.get("ssh_keys")
+        if not raw:
+            return []
+        try:
+            keys = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            return []
+        return [k for k in keys if isinstance(k, dict)]
 
     def destroy_instance(self, instance_id: int) -> None:
         data = self.request("DELETE", f"/instances/{instance_id}/", allow_404=True)
