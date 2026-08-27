@@ -476,10 +476,14 @@ ETA        = (duration - out_time) / speed
 Весь запуск, от разбора аргументов до `finally` с destroy instance, рендерится как одно [Rich](https://rich.readthedocs.io/) full-screen приложение (`ui/app.py`, alternate screen buffer — как у `htop`/`vim`), а не серия отдельных Live-виджетов. Экран разбит на три зоны:
 
 1. **Header** — название и текущая фаза (`searching offers`, `provisioning`, `encoding`, `transferring result`, `done`/`failed`);
-2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/SSH, download+GPU/NVENC/NVDEC/VRAM, progress по 1080p/720p/480p/360p, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
+2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/**cost so far**/SSH, download+GPU/NVENC/NVDEC/VRAM, progress по 1080p/720p/480p/360p, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
 3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
 
 Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением. Перерисовка идёт раз в секунду (`refresh_per_second=1`); `set_body`/`append_log` только обновляют данные `Layout`, без принудительного немедленного `refresh()` — иначе всплеск строк лога (например, вывод `apt-get`, ретранслируемый через `RemoteLogTailer`) вызывал бы столько же немедленных полных перерисовок подряд, что особенно заметно при просмотре через SSH-сессию на сам сервер.
+
+### Стоимость job в реальном времени
+
+`Cost so far` в дашборде — это `цена offer ($/h) × время с момента фактической аренды / 3600`, то есть накопленные расходы на **этот** instance к текущему моменту, а не оценка на весь job. Отсчёт времени идёт с момента успешного создания instance (`rent_instance`), а не с начала мониторинга encoding — provisioning, bootstrap и download тоже платные и должны входить в сумму. Обновляется вместе с остальным дашбордом (`--monitor-interval`). При завершении job (успех, `Ctrl+C` или сбой) тот же расчёт печатается как `Total cost` на итоговом экране и в лог — оплата идёт независимо от результата, поэтому сумма показывается во всех трёх случаях.
 
 ### Логи самой Vast-машины (до появления SSH)
 

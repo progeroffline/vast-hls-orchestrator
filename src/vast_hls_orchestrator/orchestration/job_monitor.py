@@ -29,6 +29,7 @@ def wait_for_job(
     gpu_name: str,
     hourly_price: float,
     expected_input_bytes: int | None,
+    rental_started_at: float,
     using_proxy: bool = False,
 ) -> tuple[str, int]:
     deadline = time.time() + args.job_timeout
@@ -39,7 +40,10 @@ def wait_for_job(
         host=host,
         port=port,
         expected_input_bytes=expected_input_bytes,
-        started_at=time.time(),
+        # From when Vast actually started billing (instance creation), not
+        # from when this monitoring loop happens to start -- provisioning,
+        # bootstrap and download all run (and cost money) before this point.
+        started_at=rental_started_at,
     )
     last_stage: str | None = None
     last_status: str | None = None

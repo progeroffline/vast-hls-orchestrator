@@ -28,9 +28,20 @@ from .remote.job_script import build_job_script
 from .remote.onstart import build_onstart
 from .remote.ssh import wait_for_ssh
 from .ui.app import TuiApp
+from .ui.formatting import format_cost, format_duration
 from .ui.phases import spinner_panel, summary_panel
 from .vast_api.client import VastClient
 from .vast_api.offers import choose_offers, render_offers_table, source_size_bytes
+
+
+def _cost_summary(rental_started_at: float | None, selected_offer: dict | None) -> list[str]:
+    """Total spend so far, if we got far enough to have actually rented anything."""
+    if rental_started_at is None or selected_offer is None:
+        return []
+    hourly_price = float(selected_offer.get("dph_total") or 0)
+    elapsed = time.time() - rental_started_at
+    line = f"Total cost: {format_cost(hourly_price, elapsed)} ({format_duration(elapsed)} @ ${hourly_price:.4f}/h)"
+    return [line]
 
 
 def run(args: argparse.Namespace) -> int:
@@ -82,6 +93,7 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
     create_label: str | None = None
     create_was_ambiguous = False
     published = False
+    rental_started_at: float | None = None
     original_known_hosts = args.known_hosts
     try:
         app.set_header_subtitle("searching offers")
@@ -123,6 +135,10 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
         instance_id, selected_offer, create_was_ambiguous = rent_instance(
             client, args, offers, create_label, onstart
         )
+        # Vast starts billing from here, not from whenever we later start the
+        # encode-monitoring dashboard -- provisioning/bootstrap/download all
+        # cost money too, and the displayed cost-so-far needs to include them.
+        rental_started_at = time.time()
 
         # Best-effort account-level registration too; see ensure_ssh_key_attached.
         ensure_ssh_key_attached(client, instance_id, public_key)
@@ -165,6 +181,7 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
             gpu_name=str(selected_offer.get("gpu_name") or "NVIDIA GPU"),
             hourly_price=float(selected_offer.get("dph_total") or 0),
             expected_input_bytes=input_bytes,
+            rental_started_at=rental_started_at,
             using_proxy=using_proxy,
         )
 
@@ -174,14 +191,24 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
 
         logger.success("SUCCESS")
         logger.success("Master playlist: {}", dest / "master.m3u8")
+        cost_lines = _cost_summary(rental_started_at, selected_offer)
+        for line in cost_lines:
+            logger.success("{}", line)
         app.set_header_subtitle("done")
-        app.set_body(summary_panel([f"Published: {dest / 'master.m3u8'}"], title="Success"))
+        app.set_body(
+            summary_panel([f"Published: {dest / 'master.m3u8'}", *cost_lines], title="Success")
+        )
         return 0
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
+        cost_lines = _cost_summary(rental_started_at, selected_offer)
+        for line in cost_lines:
+            logger.warning("{}", line)
         app.set_header_subtitle("interrupted")
-        app.set_body(summary_panel(["Interrupted by user"], style="yellow", title="Interrupted"))
+        app.set_body(
+            summary_panel(["Interrupted by user", *cost_lines], style="yellow", title="Interrupted")
+        )
         return 130
     except Exception as exc:
         if remote_host is not None and remote_port is not None:
@@ -190,8 +217,11 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
             logger.exception("Pipeline failed: {}", exc)
         else:
             logger.error("Pipeline failed: {}", exc)
+        cost_lines = _cost_summary(rental_started_at, selected_offer)
+        for line in cost_lines:
+            logger.error("{}", line)
         app.set_header_subtitle("failed")
-        app.set_body(summary_panel([str(exc)], style="red", title="Pipeline failed"))
+        app.set_body(summary_panel([str(exc), *cost_lines], style="red", title="Pipeline failed"))
         return 1
     finally:
         if instance_id is not None:

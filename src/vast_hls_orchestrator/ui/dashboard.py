@@ -12,7 +12,7 @@ from rich.text import Text
 
 from ..core.constants import RENDITIONS
 from ..core.models import DashboardContext, RemoteSnapshot
-from .formatting import bar, format_bytes, format_duration
+from .formatting import bar, format_bytes, format_cost, format_duration
 
 
 def render_dashboard(ctx: DashboardContext, snap: RemoteSnapshot) -> Group:
@@ -24,6 +24,10 @@ def render_dashboard(ctx: DashboardContext, snap: RemoteSnapshot) -> Group:
     summary.add_row(
         f"[bold]Instance[/]: {ctx.instance_id}  [bold]GPU[/]: {escape(ctx.gpu_name)}",
         f"[bold]Price[/]: ${ctx.hourly_price:.4f}/h  [bold]Elapsed[/]: {format_duration(elapsed)}",
+    )
+    summary.add_row(
+        "",
+        f"[bold]Cost so far[/]: {format_cost(ctx.hourly_price, elapsed)}",
     )
     summary.add_row(
         f"[bold]SSH[/]: {escape(ctx.host)}:{ctx.port}",

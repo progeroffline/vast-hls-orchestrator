@@ -14,6 +14,11 @@ def format_duration(seconds: float | None) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def format_cost(hourly_price: float, elapsed_seconds: float) -> str:
+    cost = max(0.0, hourly_price) * max(0.0, elapsed_seconds) / 3600.0
+    return f"${cost:.4f}"
+
+
 def format_bytes(n: int | None) -> str:
     if not n or n <= 0:
         return "0 B"
