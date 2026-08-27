@@ -6,11 +6,26 @@ import base64
 import shlex
 
 
-def build_onstart(job_script: str, failsafe_seconds: int) -> str:
+def build_onstart(job_script: str, failsafe_seconds: int, authorized_key: str) -> str:
     payload = base64.b64encode(job_script.encode()).decode()
+    quoted_key = shlex.quote(authorized_key.strip())
+    # Vast's account-level SSH key injection has been observed to report a key
+    # as "attached" (confirmed via its own API) while the container's actual
+    # authorized_keys never receives it -- a platform-side sync gap outside
+    # this tool's control. Writing the key ourselves, here, with root access
+    # inside the container, is a guarantee that doesn't depend on Vast's own
+    # bookkeeping being in sync with reality. Done first, before anything else
+    # that could fail or take a while.
+    key_setup = f"""mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+grep -qxF {quoted_key} /root/.ssh/authorized_keys || printf '%s\n' {quoted_key} >> /root/.ssh/authorized_keys
+"""
     bootstrap = f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
+{key_setup}
 mkdir -p /workspace
 rm -f /workspace/JOB_DONE /workspace/JOB_EXIT
 printf 'bootstrap\n' > /workspace/JOB_STAGE

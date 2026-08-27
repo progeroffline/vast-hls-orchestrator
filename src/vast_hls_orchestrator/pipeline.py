@@ -11,12 +11,14 @@ from typing import Any
 from loguru import logger
 
 from .core.console import console
+from .core.errors import VastError
 from .core.validation import validate_inputs
 from .orchestration.diagnostics import collect_remote_diagnostics
 from .orchestration.job_monitor import wait_for_job
 from .orchestration.local_state import acquire_video_lock, recover_local_publish_state
 from .orchestration.provisioning import (
     ensure_ssh_key_attached,
+    read_public_key,
     rent_instance,
     wait_for_running,
 )
@@ -101,8 +103,19 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
         args.known_hosts.touch(mode=0o600, exist_ok=True)
         args.known_hosts.chmod(0o600)
 
+        # The onstart script writes this directly into the instance's own
+        # authorized_keys with root access -- the actual guarantee for SSH
+        # access, independent of whether Vast's own account-level key
+        # injection is in sync with the running container (see onstart.py).
+        public_key = read_public_key(args.ssh_key)
+        if not public_key:
+            raise VastError(
+                f"Could not read public key for {args.ssh_key} (looked for "
+                f"{args.ssh_key}.pub and tried ssh-keygen -y)"
+            )
+
         job_script = build_job_script(args.source_url, input_bytes)
-        onstart = build_onstart(job_script, args.failsafe_seconds)
+        onstart = build_onstart(job_script, args.failsafe_seconds, public_key)
         create_label = f"hls-{args.video_id}-{int(time.time())}-{os.getpid()}"
 
         app.set_header_subtitle("renting a GPU instance")
@@ -111,10 +124,8 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
             client, args, offers, create_label, onstart
         )
 
-        # Account-level key injection doesn't reliably apply to instances
-        # created straight through the API the way it does via the console,
-        # so attach our key to this instance explicitly too.
-        ensure_ssh_key_attached(client, instance_id, args.ssh_key)
+        # Best-effort account-level registration too; see ensure_ssh_key_attached.
+        ensure_ssh_key_attached(client, instance_id, public_key)
 
         # Vast's own container logs work without SSH, so they're the only window
         # into what the rented machine is doing until wait_for_ssh succeeds.

@@ -34,26 +34,17 @@ def read_public_key(ssh_key_path: Path) -> str | None:
         return None
 
 
-def ensure_ssh_key_attached(client: VastClient, instance_id: int, ssh_key_path: Path) -> None:
-    """Attach our key to the instance via the API, then verify it actually landed.
+def ensure_ssh_key_attached(client: VastClient, instance_id: int, public_key: str) -> None:
+    """Best-effort: also register our key with Vast's own account-level mechanism.
 
-    Vast auto-injects account-level keys (Console -> Keys) into new instances,
-    but observed in practice to sometimes inject only *one* of several
-    registered keys -- not necessarily this one. attach_ssh_key's "already
-    associated" response is ambiguous about which key that refers to, so
-    trusting it at face value can silently leave the wrong key on the
-    instance while the pipeline waits out the SSH timeout for a connection
-    that can never succeed. This confirms via list_ssh_keys instead, and
-    raises (fatal, not a warning) if our key genuinely isn't there.
+    This is a secondary safety net, not the primary guarantee -- the onstart
+    script (see remote/onstart.py) writes the same key directly into the
+    container's authorized_keys with root access, which doesn't depend on
+    Vast's account-level injection being in sync with the running container
+    (observed in practice to sometimes report a key as "attached" via this
+    very API while the container's actual authorized_keys never receives it).
+    Failure here is only logged: it isn't what SSH access actually depends on.
     """
-    public_key = read_public_key(ssh_key_path)
-    if not public_key:
-        raise VastError(
-            f"Could not read public key for {ssh_key_path} (looked for "
-            f"{ssh_key_path}.pub and tried ssh-keygen -y); cannot confirm it "
-            f"will be attached to the instance"
-        )
-
     try:
         client.attach_ssh_key(instance_id, public_key)
     except VastError as exc:
@@ -64,13 +55,12 @@ def ensure_ssh_key_attached(client: VastClient, instance_id: int, ssh_key_path: 
     attached = {key.get("public_key", "").strip() for key in client.list_ssh_keys(instance_id)}
     if public_key.strip() in attached:
         logger.debug("Confirmed SSH key is attached to instance {}", instance_id)
-        return
-    raise VastError(
-        f"Our SSH key is not attached to instance {instance_id}: Vast attached a "
-        f"different account key at creation and did not accept ours instead. "
-        f"Add it manually via Console -> that instance -> SSH, or check the "
-        f"account for conflicting registered keys, before retrying."
-    )
+    else:
+        logger.warning(
+            "Vast does not list our key as attached to instance {} -- relying on "
+            "the onstart-injected authorized_keys entry for SSH access instead",
+            instance_id,
+        )
 
 
 def wait_for_running(
