@@ -236,12 +236,20 @@ uv run python -c "import vast_hls_orchestrator"
 
 ## Запуск
 
-Обычный запуск на Binary Racks:
+Команды ниже выполняются **из директории проекта** (там, где лежит `pyproject.toml`) — если вы следовали разделу [Установка](#установка), это `/opt/vast-hls-orchestrator` на Binary Racks:
+
+```bash
+cd /opt/vast-hls-orchestrator   # или ваша рабочая копия репозитория
+```
+
+Запуск из другой директории — через `uv run --directory <путь-к-проекту> vast-hls-orchestrator ...`.
+
+Обычный запуск:
 
 ```bash
 export VAST_API_KEY='...'
 
-uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
+uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4
 ```
@@ -249,7 +257,7 @@ uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
 Расширенные диагностические сообщения:
 
 ```bash
-uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
+uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --verbose
@@ -258,7 +266,7 @@ uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
 Только поиск и рейтинг offers, без аренды:
 
 ```bash
-uv run --directory /opt/vast-hls-orchestrator vast-hls-orchestrator \
+uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --dry-run
