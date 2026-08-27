@@ -70,10 +70,19 @@ def fetch_remote_snapshot(
     host: str,
     port: int,
 ) -> RemoteSnapshot:
+    # META_DOWNLOADED reads actual disk blocks (`stat %b`, always 512-byte units
+    # on Linux), not apparent/logical file size (`stat %s`). aria2c downloads
+    # this file with --file-allocation=none across 16 parallel HTTP Range
+    # connections writing at arbitrary offsets -- with no preallocation, that
+    # produces a sparse file whose *apparent* size is just "highest offset any
+    # connection has reached so far", not real bytes downloaded. That made
+    # progress jump far ahead as soon as a late-offset connection wrote its
+    # first byte, then crawl for the remaining connections regardless of their
+    # real throughput. Block count only grows as bytes actually land on disk.
     command = r"""
 printf 'META_STAGE='; cat /workspace/JOB_STAGE 2>/dev/null || echo bootstrap
 printf 'META_STATUS='; if [ -f /workspace/JOB_DONE ]; then printf 'DONE:'; cat /workspace/JOB_EXIT 2>/dev/null || echo 1; else echo RUNNING; fi
-printf 'META_DOWNLOADED='; stat -c %s /workspace/input/source.mp4 2>/dev/null || echo 0
+printf 'META_DOWNLOADED='; echo $(( $(stat -c '%b' /workspace/input/source.mp4 2>/dev/null || echo 0) * 512 ))
 printf 'META_DURATION='; cat /workspace/input/duration.txt 2>/dev/null || echo 0
 printf 'META_GPU='; nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null || true
 echo 'PROGRESS_BEGIN'
