@@ -252,7 +252,8 @@ export VAST_API_KEY='...'
 
 uv run vast-hls-orchestrator \
   --video-id test \
-  --source-url https://origin.example.com/video/test.mp4
+  --source-url https://origin.example.com/video/test.mp4 \
+  --ssh-key /root/.ssh/vast_encoder
 ```
 
 Расширенные диагностические сообщения:
@@ -261,6 +262,7 @@ uv run vast-hls-orchestrator \
 uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
+  --ssh-key /root/.ssh/vast_encoder \
   --verbose
 ```
 
@@ -270,10 +272,11 @@ uv run vast-hls-orchestrator \
 uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
+  --ssh-key /root/.ssh/vast_encoder \
   --dry-run
 ```
 
-Dry-run требует `VAST_API_KEY`, но не требует локального SSH private key и ничего не создаёт в Vast.
+`--ssh-key` — обязательный параметр CLI при любом запуске (в том числе `--dry-run`, argparse проверяет его наличие независимо от режима), но сам файл ключа для dry-run не читается и не обязан существовать. Dry-run требует `VAST_API_KEY` и ничего не создаёт в Vast.
 
 ## Поиск, фильтрация и рейтинг машин
 
@@ -568,7 +571,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--video-id` | required | Безопасный ID и имя origin-каталога |
 | `--source-url` | required | Публичный HTTP(S) MP4 URL |
 | `--origin-root` | `/var/www/html/video` | Корень публикации |
-| `--ssh-key` | `/root/.ssh/vast_encoder` | Локальный private key для Vast SSH |
+| `--ssh-key` | **обязателен** | Локальный private key для Vast SSH; публичная часть должна быть заранее добавлена в тот же аккаунт Vast.ai, чей `VAST_API_KEY` используется |
 | `--known-hosts` | `/root/.ssh/vast_known_hosts` | Базовое имя ephemeral known-hosts file |
 | `--image` | CUDA 12.6.3 Ubuntu 24.04 | Vast Docker image |
 | `--disk-gb` | `40` | Размер instance disk |

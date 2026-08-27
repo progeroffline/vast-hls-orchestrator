@@ -18,7 +18,15 @@ def parse_args() -> argparse.Namespace:
         "--source-url", required=True, help="Public/readable source MP4 URL"
     )
     parser.add_argument("--origin-root", type=Path, default=Path("/var/www/html/video"))
-    parser.add_argument("--ssh-key", type=Path, default=Path("/root/.ssh/vast_encoder"))
+    parser.add_argument(
+        "--ssh-key",
+        type=Path,
+        required=True,
+        help=(
+            "Local private key for Vast SSH; its public half must already be "
+            "registered in the Vast.ai account used for VAST_API_KEY"
+        ),
+    )
     parser.add_argument(
         "--known-hosts", type=Path, default=Path("/root/.ssh/vast_known_hosts")
     )
