@@ -612,7 +612,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--boot-timeout` | `600` | Provisioning timeout, seconds |
 | `--job-timeout` | `10800` | Remote job timeout, seconds |
 | `--failsafe-seconds` | `14400` | Задержка self-destroy watchdog |
-| `--monitor-interval` | `2` | Частота SSH telemetry polling |
+| `--monitor-interval` | `1.5` | Частота SSH telemetry polling |
 | `--ssh-reconnect-timeout` | `180` | Допустимая длительность SSH outage |
 | `--rsync-retries` | `4` | Число resumable transfer attempts |
 | `--gpus` | 3060/A2000/4060 | Разрешённые GPU names |

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--monitor-interval",
         type=float,
-        default=2.0,
+        default=1.5,
         help="Seconds between Rich dashboard refresh queries",
     )
     parser.add_argument(
