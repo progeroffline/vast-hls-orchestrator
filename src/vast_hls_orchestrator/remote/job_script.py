@@ -19,7 +19,6 @@ STAGE=/workspace/JOB_STAGE
 INPUT=/workspace/input/source.mp4
 DURATION_FILE=/workspace/input/duration.txt
 OUT=/workspace/out
-CHILDREN=()
 rm -f "$DONE" "$STATUS"
 mkdir -p /workspace/input "$OUT"/{{1080p,720p,480p,360p}}
 
@@ -30,19 +29,9 @@ set_stage() {{
   printf '[%s] STAGE: %s\n' "$(date -u +%FT%TZ)" "$1"
 }}
 
-stop_children() {{
-  if [ "${{#CHILDREN[@]}}" -gt 0 ]; then
-    kill -TERM "${{CHILDREN[@]}}" 2>/dev/null || true
-    sleep 2
-    kill -KILL "${{CHILDREN[@]}}" 2>/dev/null || true
-    wait "${{CHILDREN[@]}}" 2>/dev/null || true
-  fi
-}}
-
 finish() {{
   rc=$?
   trap - EXIT INT TERM
-  stop_children
   printf '%s\n' "$rc" > "$STATUS.tmp.$$"
   mv -f "$STATUS.tmp.$$" "$STATUS"
   if [ "$rc" -eq 0 ]; then
@@ -167,33 +156,34 @@ encode_variant() {{
   return "$rc"
 }}
 
-set_stage encoding
-encode_variant 1080p 1920:1080 6500k 7150k 13000k 160k 19 & CHILDREN+=("$!")
-encode_variant 720p  1280:720  3500k 3850k 7000k  128k 20 & CHILDREN+=("$!")
-encode_variant 480p  854:480   1800k 2000k 3600k  128k 21 & CHILDREN+=("$!")
-encode_variant 360p  640:360   900k  1000k 1800k  96k  22 & CHILDREN+=("$!")
-
-active=("${{CHILDREN[@]}}")
-while [ "${{#active[@]}}" -gt 0 ]; do
-  finished=""
-  if wait -n -p finished "${{active[@]}}"; then rc=0; else rc=$?; fi
-  next=()
-  for pid in "${{active[@]}}"; do
-    if [ "$pid" != "$finished" ]; then next+=("$pid"); fi
-  done
-  active=("${{next[@]}}")
+run_variant() {{
+  name="$1"
+  # A subshell (not backgrounding with &) keeps encode_variant's own EXIT/INT/TERM
+  # traps scoped to it instead of clobbering this script's top-level `finish` trap,
+  # while still blocking here until this one rendition is fully done. set +e
+  # around it, then checking $rc explicitly, avoids two separate pitfalls: a
+  # bare failing statement would trip `set -e` before this function's own
+  # diagnostics run, and `if ( ... ); then` discards the real exit status (an
+  # `if` with no matching branch always leaves $? at 0, not the condition's).
+  set +e
+  ( encode_variant "$@" )
+  rc=$?
+  set -e
   if [ "$rc" -ne 0 ]; then
-    echo "A rendition failed (pid=$finished rc=$rc); cancelling the others" >&2
-    CHILDREN=("${{active[@]}}")
-    stop_children
+    echo "Rendition $name failed (rc=$rc)" >&2
     for q in 1080p 720p 480p 360p; do
       echo "--- $q log tail ---"
       tail -n 80 "$OUT/$q/ffmpeg.log" 2>/dev/null || true
     done
     exit 20
   fi
-done
-CHILDREN=()
+}}
+
+set_stage encoding
+run_variant 1080p 1920:1080 6500k 7150k 13000k 160k 19
+run_variant 720p  1280:720  3500k 3850k 7000k  128k 20
+run_variant 480p  854:480   1800k 2000k 3600k  128k 21
+run_variant 360p  640:360   900k  1000k 1800k  96k  22
 
 set_stage finalizing
 cat > "$OUT/master.m3u8.tmp" <<'EOF'

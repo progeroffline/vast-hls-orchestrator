@@ -74,7 +74,7 @@ src/vast_hls_orchestrator/
 │   └── offers.py                  # оценка размера source, ranking, таблица offers (без вывода)
 │
 ├── remote/                    # всё, что выполняется на/через временный Vast instance
-│   ├── job_script.py             # bash-скрипт: download, GPU preflight, параллельный ABR encode
+│   ├── job_script.py             # bash-скрипт: download, GPU preflight, последовательный ABR encode
 │   ├── onstart.py                  # bootstrap (`onstart`): watchdog, apt-get, запуск job
 │   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh
 │   └── snapshot.py                   # парсинг FFmpeg `-progress` и nvidia-smi по SSH
@@ -108,7 +108,7 @@ src/vast_hls_orchestrator/
 7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint.
 8. Vast выполняет переданный `onstart`: запускает watchdog, устанавливает пакеты и стартует remote encode job.
 9. Origin через SSH опрашивает stage, download size, GPU telemetry, progress-файлы и tails логов.
-10. Remote job скачивает source, проверяет диск и GPU pipeline, затем параллельно кодирует четыре rendition.
+10. Remote job скачивает source, проверяет диск и GPU pipeline, затем кодирует четыре rendition по очереди.
 11. После успеха всех rendition создаётся `master.m3u8` и проверяется структура результата.
 12. Origin делает resumable `rsync pull` в staging-каталог.
 13. Staging валидируется, служебные progress/log-файлы удаляются, HLS публикуется.
@@ -417,7 +417,7 @@ NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null mux
 
 ## FFmpeg и ABR HLS
 
-Четыре независимых FFmpeg-процесса запускаются параллельно:
+Четыре rendition кодируются по очереди, один FFmpeg-процесс за раз, в фиксированном порядке 1080p → 720p → 480p → 360p:
 
 | Rendition | Resolution | Video | Maxrate | Bufsize | Audio | CQ |
 |---|---:|---:|---:|---:|---:|---:|
@@ -451,11 +451,11 @@ NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null mux
 └── 360p/
 ```
 
-Если один FFmpeg завершается с ошибкой, Bash `wait -n` обнаруживает это сразу, посылает TERM остальным процессам, затем KILL зависшим процессам и печатает tails всех FFmpeg logs. Master playlist создаётся только после успеха всех четырёх процессов и проверки `#EXT-X-ENDLIST`/segments.
+Если очередной FFmpeg завершается с ошибкой, `run_variant` сразу печатает tails всех четырёх `ffmpeg.log` (для уже пройденных rendition это будет успешный лог, для текущего — причина сбоя) и останавливает job, не запуская оставшиеся по очереди rendition. Master playlist создаётся только после успеха всех четырёх и проверки `#EXT-X-ENDLIST`/segments.
 
-### Почему четыре процесса, а не один FFmpeg split
+### Почему по очереди, а не параллельно
 
-Один decode + CUDA split снизил бы нагрузку NVDEC и чтение source. Текущая схема оставлена ради более простой диагностики, отдельных progress/log-файлов и понятного контроля каждого rendition. На данных GPU четыре NVENC output находятся в допустимом практическом диапазоне. Если NVDEC станет bottleneck на 4K/high-FPS source, переход на единый filter graph стоит рассматривать как отдельную оптимизацию и проверять нагрузочным тестом.
+Каждый rendition получает выделенный NVDEC/NVENC на всё время своего прохода, без конкуренции за encoder sessions с соседними процессами — это particularly важно на бюджетных GPU (RTX 3060/A2000/4060 из allow-list), где параллельный запуск четырёх NVENC-сессий одновременно может делить друг друга и непредсказуемо влиять на скорость каждой. Компромисс — суммарное время job для одного видео растёт (сумма времени всех rendition вместо максимума), но каждый отдельный rendition кодируется на полной скорости своего слота, и логи/прогресс каждого этапа проще читать последовательно, один за другим.
 
 ## Live UI, progress и логи
 
