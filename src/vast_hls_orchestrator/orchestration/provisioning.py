@@ -138,7 +138,11 @@ def rent_instance(
             "image": args.image,
             "disk": args.disk_gb,
             "label": create_label,
-            "runtype": "ssh_direct",
+            # Request proxy SSH alongside direct: direct's per-instance reverse
+            # tunnel has been observed to fail to register on some hosts even
+            # though the container is otherwise healthy, and proxy SSH goes
+            # through Vast's own infrastructure instead, unaffected by that.
+            "runtype": "ssh_direct ssh_proxy",
             "target_state": "running",
             "env": {"NVIDIA_DRIVER_CAPABILITIES": "compute,video,utility"},
             "onstart": onstart,

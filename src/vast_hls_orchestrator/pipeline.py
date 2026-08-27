@@ -125,10 +125,23 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
         info = wait_for_running(client, instance_id, args.boot_timeout, on_poll=log_tailer.poll)
         remote_host = str(info["ssh_host"])
         remote_port = int(info["ssh_port"])
+        proxy_host = info.get("ssh_proxy_addr")
+        proxy_port = info.get("ssh_proxy_port")
         logger.info("SSH endpoint: root@{}:{}", remote_host, remote_port)
 
         app.set_body(spinner_panel(f"Waiting for SSH on {remote_host}:{remote_port}..."))
-        wait_for_ssh(args, remote_host, remote_port, on_poll=log_tailer.poll)
+        direct_host, direct_port = remote_host, remote_port
+        remote_host, remote_port = wait_for_ssh(
+            args,
+            direct_host,
+            direct_port,
+            proxy_host=str(proxy_host) if proxy_host else None,
+            proxy_port=int(proxy_port) if proxy_port else None,
+            on_poll=log_tailer.poll,
+        )
+        using_proxy = (remote_host, remote_port) != (direct_host, direct_port)
+        if using_proxy:
+            logger.warning("Direct SSH never came up; continuing over Vast's proxy SSH instead")
 
         app.set_header_subtitle("encoding")
         remote_host, remote_port = wait_for_job(
@@ -141,6 +154,7 @@ def _run(args: argparse.Namespace, app: TuiApp) -> int:
             gpu_name=str(selected_offer.get("gpu_name") or "NVIDIA GPU"),
             hourly_price=float(selected_offer.get("dph_total") or 0),
             expected_input_bytes=input_bytes,
+            using_proxy=using_proxy,
         )
 
         app.set_header_subtitle("transferring result")

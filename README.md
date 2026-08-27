@@ -314,13 +314,19 @@ Offers сортируются лексикографически по следу
 ```text
 image:        nvidia/cuda:12.6.3-runtime-ubuntu24.04
 disk:         40 GB
-runtype:      ssh_direct
+runtype:      ssh_direct ssh_proxy
 target_state: running
 cancel_unavail: true
 NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ```
 
 Также передаются уникальный label и `onstart` script. Label используется не только для удобства: если TCP-соединение оборвалось после PUT и неизвестно, создал ли Vast instance, orchestrator ищет instance через `GET /api/v1/instances` с точным label. До завершения reconciliation новый offer не арендуется — это защищает от «потерянного» платного instance.
+
+### Direct SSH с fallback на proxy SSH
+
+`runtype` запрашивает оба способа подключения одновременно (как это делает официальный `vastai ssh --direct`, а не только `ssh_direct` в одиночку). Причина: у direct SSH per-instance reverse-tunnel на конкретном host может не зарегистрироваться (на практике это проявлялось повторяющимся `remote port forwarding failed for listen port <port>` в логах инстанса), даже когда сам контейнер полностью здоров. Proxy SSH идёт через отдельную инфраструктуру Vast и от этого не зависит.
+
+`wait_for_ssh` поэтому пробует **оба** адреса на каждой попытке — `ssh_host`/`ssh_port` (direct) и `ssh_proxy_addr`/`ssh_proxy_port` (proxy) из ответа `show_instance` — и возвращает тот, что реально ответил первым. Если сработал только proxy, дальнейший мониторинг (`wait_for_job`) и `rsync` идут уже через него; при этом сверка «не сменил ли Vast SSH endpoint» также сравнивается с полями нужного типа (proxy или direct), а не всегда с direct — иначе успешное proxy-подключение тут же перезаписывалось бы обратно нерабочим direct-адресом.
 
 API retries:
 

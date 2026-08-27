@@ -29,6 +29,7 @@ def wait_for_job(
     gpu_name: str,
     hourly_price: float,
     expected_input_bytes: int | None,
+    using_proxy: bool = False,
 ) -> tuple[str, int]:
     deadline = time.time() + args.job_timeout
     ctx = DashboardContext(
@@ -54,9 +55,14 @@ def wait_for_job(
         if state in BAD_STATES:
             raise VastError(f"Instance entered bad state during encoding: {state}")
 
-        new_host = str(info.get("ssh_host") or host)
+        # Reconcile against whichever endpoint kind we're actually using --
+        # comparing a proxy connection against the direct fields (or vice
+        # versa) would look like Vast "changed" it and bounce us back to an
+        # endpoint that may not even be reachable.
+        host_key, port_key = ("ssh_proxy_addr", "ssh_proxy_port") if using_proxy else ("ssh_host", "ssh_port")
+        new_host = str(info.get(host_key) or host)
         try:
-            new_port = int(info.get("ssh_port") or port)
+            new_port = int(info.get(port_key) or port)
         except (TypeError, ValueError):
             new_port = port
         if (new_host, new_port) != (host, port):
