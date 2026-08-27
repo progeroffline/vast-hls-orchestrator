@@ -84,7 +84,7 @@ for q in 1080p 720p 480p 360p; do
   echo "PROGRESS_END:$q"
 done
 echo 'REMOTE_LOG_BEGIN'
-{{ cat /workspace/bootstrap.log 2>/dev/null; cat /workspace/job.log 2>/dev/null; }} | tr '\r' '\n' | tail -n 8 || true
+{{ tail -c 4000 /workspace/bootstrap.log 2>/dev/null; tail -c 4000 /workspace/job.log 2>/dev/null; }} | tr '\r' '\n' | tail -n 8 || true
 echo 'REMOTE_LOG_END'
 """
     result = ssh_run(args, host, port, command, timeout=20)

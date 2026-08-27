@@ -463,6 +463,8 @@ NVDEC decode → CUDA frames → scale_cuda 640×360 → h264_nvenc → null mux
 
 Обычный stderr `-stats` не парсится. Каждый процесс получает собственный `-progress` endpoint через FIFO. Relay на remote стороне собирает полный record до строки `progress=...`, записывает временный файл и делает `mv` в `progress.txt`. Origin поэтому не читает наполовину записанные records.
 
+Хвост `bootstrap.log`/`job.log` для панели "Remote log tail" читается через `tail -c 4000 <файл>` для каждого файла, а не через `cat` целиком — во время download aria2 непрерывно дописывает в `job.log` (прогресс каждую секунду), и `cat` растущего файла на **каждом** опросе (`--monitor-interval`) со временем всё дольше идёт по SSH; `tail -c` не сканирует файл целиком независимо от его размера.
+
 Поля `frame`, `fps`, `out_time_us`, `bitrate`, `speed` и `progress` опрашиваются по SSH. Процент рассчитывается как:
 
 ```text
@@ -478,7 +480,7 @@ ETA        = (duration - out_time) / speed
 2. **Body** — контент конкретной фазы: spinner при поиске offers/аренде/provisioning/ожидании SSH, таблица топ-5 offers, четырёхпанельный ABR-дашборд во время encoding (stage/instance/GPU/price/elapsed/SSH, download+GPU/NVENC/NVDEC/VRAM, progress по 1080p/720p/480p/360p, remote log tail) или live-строка `rsync --info=progress2` во время transfer;
 3. **Log** — хвост локальных Loguru-сообщений оркестратора в реальном времени.
 
-Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением.
+Тело меняется по ходу job вместо открытия новых Live-контекстов — так весь процесс остаётся одним непрерывным full-screen приложением. Перерисовка идёт раз в секунду (`refresh_per_second=1`); `set_body`/`append_log` только обновляют данные `Layout`, без принудительного немедленного `refresh()` — иначе всплеск строк лога (например, вывод `apt-get`, ретранслируемый через `RemoteLogTailer`) вызывал бы столько же немедленных полных перерисовок подряд, что особенно заметно при просмотре через SSH-сессию на сам сервер.
 
 ### Логи самой Vast-машины (до появления SSH)
 

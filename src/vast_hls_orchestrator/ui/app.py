@@ -42,7 +42,7 @@ class TuiApp:
         self.layout["header"].update(self._header_panel())
         self.layout["body"].update(Text("Starting...", style="dim"))
         self._render_log_panel()
-        self.live = Live(self.layout, console=console, screen=True, refresh_per_second=4)
+        self.live = Live(self.layout, console=console, screen=True, refresh_per_second=1)
 
     def _header_panel(self, subtitle: str = "") -> Panel:
         text = Text(self.title, style="bold cyan")
