@@ -23,6 +23,10 @@ def validate_inputs(args: argparse.Namespace) -> None:
         raise VastError("--source-url must be an absolute HTTP(S) URL")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.source_url):
         raise VastError("--source-url contains control characters")
+    if not args.origin_ssh_host or any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in args.origin_ssh_host
+    ):
+        raise VastError("--origin-ssh-host must be a non-empty hostname/IP")
     for name in (
         "disk_gb",
         "boot_timeout",
@@ -30,9 +34,22 @@ def validate_inputs(args: argparse.Namespace) -> None:
         "failsafe_seconds",
         "ssh_reconnect_timeout",
         "rsync_retries",
+        "origin_ssh_port",
     ):
         if getattr(args, name) <= 0:
             raise VastError(f"--{name.replace('_', '-')} must be positive")
+    # Directly controls how many concurrent outbound SSH connections the
+    # remote job opens against origin's sshd -- a typo here (e.g. an extra
+    # zero) shouldn't be able to accidentally hammer it.
+    if not (1 <= args.upload_workers <= 64):
+        raise VastError("--upload-workers must be between 1 and 64")
+    if args.upload_worker_stagger < 0:
+        raise VastError("--upload-worker-stagger must not be negative")
+    if args.upload_worker_stagger == 0:
+        logger.warning(
+            "--upload-worker-stagger is 0; simultaneous worker starts can trip "
+            "origin sshd's MaxStartups (see README) unless it's configured generously"
+        )
     if args.monitor_interval <= 0 or args.max_hourly <= 0:
         raise VastError("--monitor-interval and --max-hourly must be positive")
     if args.failsafe_seconds <= args.job_timeout:

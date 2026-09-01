@@ -84,6 +84,8 @@ def test_fetch_remote_snapshot_parses_stage_status_progress_and_log():
         "META_STATUS=DONE:0\n"
         "META_DOWNLOADED=123456\n"
         "META_DURATION=600.0\n"
+        "META_UPLOAD_TOTAL_BYTES=987654321\n"
+        "META_UPLOAD_WORKERS_DONE=7\n"
         "META_GPU=45,80,60,4096,24576,150\n"
         "PROGRESS_BEGIN\n"
         "frame=100\n"
@@ -110,6 +112,8 @@ def test_fetch_remote_snapshot_parses_stage_status_progress_and_log():
     assert snap.status == "DONE:0"
     assert snap.downloaded_bytes == 123456
     assert snap.duration_seconds == 600.0
+    assert snap.upload_total_bytes == 987654321
+    assert snap.upload_workers_done == 7
     assert snap.remote_log_tail == "line-from-bootstrap\nline-from-job"
     assert snap.encode.frame == 100
     assert snap.encode.progress == "continue"

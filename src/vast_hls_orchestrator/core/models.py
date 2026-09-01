@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -38,6 +39,13 @@ class RemoteSnapshot:
     power_w: float | None = None
     encode: EncodeProgress = field(default_factory=EncodeProgress)
     remote_log_tail: str = ""
+    # Set once the remote job enters the uploading stage: total bytes it
+    # intends to push (segments + playlists + master), and how many of the
+    # parallel upload workers have finished. Actual bytes-transferred-so-far
+    # is *not* polled remotely -- origin computes that itself from the local
+    # staging directory's real disk usage (see orchestration/publish.py).
+    upload_total_bytes: int = 0
+    upload_workers_done: int = 0
 
 
 @dataclass
@@ -51,3 +59,8 @@ class JobContext:
     port: int
     expected_input_bytes: int | None
     started_at: float
+    # Local staging directory Vast is pushing the result into -- lets
+    # _log_progress compute upload progress from real local disk usage
+    # instead of needing new remote byte-level reporting.
+    upload_staging_dir: Path | None = None
+    upload_workers_total: int = 0

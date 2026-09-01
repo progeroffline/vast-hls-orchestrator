@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import subprocess
 import time
+from pathlib import Path
 
 from loguru import logger
 
 from ..core.constants import BAD_STATES
 from ..core.errors import VastError
 from ..core.models import JobContext, RemoteSnapshot
+from ..orchestration.publish import staging_bytes_on_disk
 from ..remote.snapshot import fetch_remote_snapshot
 from ..remote.ssh import ssh_run
 from ..ui.formatting import format_bytes, format_cost, format_duration
@@ -21,35 +23,77 @@ from ..vast_api.client import VastClient
 PROGRESS_LOG_INTERVAL_S = 10.0
 
 
-def _log_progress(ctx: JobContext, snap: RemoteSnapshot) -> None:
+def _append_upload_progress(
+    parts: list[str], ctx: JobContext, snap: RemoteSnapshot, upload_state: dict
+) -> None:
+    # Bytes-transferred-so-far is *not* polled from the remote job -- origin
+    # already owns the staging directory Vast is pushing into, so it's
+    # cheaper and just as accurate to inspect its real on-disk usage
+    # directly (same "actual disk blocks" reasoning as the download-progress
+    # fix). Only the total (what the push is aiming for) and worker-done
+    # count come from the remote poll, since origin has no way to know
+    # those on its own.
+    uploaded = staging_bytes_on_disk(ctx.upload_staging_dir) if ctx.upload_staging_dir else 0
+    total = snap.upload_total_bytes
+
+    now = time.time()
+    prev_bytes = upload_state.get("bytes")
+    prev_at = upload_state.get("at")
+    speed_bps = 0.0
+    if prev_bytes is not None and prev_at is not None and now > prev_at:
+        speed_bps = max(0.0, (uploaded - prev_bytes) / (now - prev_at))
+    upload_state["bytes"] = uploaded
+    upload_state["at"] = now
+
+    if total:
+        pct = min(100.0, uploaded * 100.0 / total)
+        parts.append(f"uploaded={pct:4.1f}% ({format_bytes(uploaded)}/{format_bytes(total)})")
+    else:
+        parts.append(f"uploaded={format_bytes(uploaded)}")
+    if speed_bps > 0:
+        parts.append(f"speed={speed_bps / (1024 * 1024):.1f} MiB/s")
+        if total and total > uploaded:
+            eta_seconds = (total - uploaded) / speed_bps
+            parts.append(f"eta={format_duration(eta_seconds)}")
+    parts.append(f"workers={snap.upload_workers_done}/{ctx.upload_workers_total}")
+
+
+def _log_progress(
+    ctx: JobContext, snap: RemoteSnapshot, upload_state: dict | None = None
+) -> None:
     elapsed = max(0.0, time.time() - ctx.started_at)
     parts = [f"stage={snap.stage}"]
-    if ctx.expected_input_bytes:
-        # downloaded_bytes is real disk blocks allocated (stat %b -- see
-        # remote/snapshot.py), expected_input_bytes is the source URL's
-        # logical Content-Length: different units that can legitimately
-        # diverge by a few percent (filesystem block-alignment overhead
-        # across aria2's 16 parallel segments), so this can exceed 100%
-        # without anything actually being wrong. Clamp only the displayed
-        # percentage; the raw byte counts alongside it stay honest.
-        pct = min(100.0, snap.downloaded_bytes * 100.0 / ctx.expected_input_bytes)
-        parts.append(
-            f"download={pct:4.1f}% ({format_bytes(snap.downloaded_bytes)}/{format_bytes(ctx.expected_input_bytes)})"
-        )
-    if snap.duration_seconds > 0:
-        parts.append(
-            f"media={format_duration(snap.encode.out_time_seconds)}/{format_duration(snap.duration_seconds)}"
-        )
-    if snap.encode.fps:
-        parts.append(f"fps={snap.encode.fps:.1f}")
-    if snap.encode.speed:
-        parts.append(f"speed={snap.encode.speed:.2f}x")
-    if snap.duration_seconds > 0 and snap.encode.speed > 0:
-        # All four renditions share one decode/encode pass, so one ETA
-        # covers the whole ABR ladder -- they finish together.
-        remaining_media = snap.duration_seconds - snap.encode.out_time_seconds
-        eta_seconds = max(0.0, remaining_media) / snap.encode.speed
-        parts.append(f"eta={format_duration(eta_seconds)}")
+
+    if snap.stage == "uploading":
+        _append_upload_progress(parts, ctx, snap, upload_state if upload_state is not None else {})
+    else:
+        if ctx.expected_input_bytes:
+            # downloaded_bytes is real disk blocks allocated (stat %b -- see
+            # remote/snapshot.py), expected_input_bytes is the source URL's
+            # logical Content-Length: different units that can legitimately
+            # diverge by a few percent (filesystem block-alignment overhead
+            # across aria2's 16 parallel segments), so this can exceed 100%
+            # without anything actually being wrong. Clamp only the displayed
+            # percentage; the raw byte counts alongside it stay honest.
+            pct = min(100.0, snap.downloaded_bytes * 100.0 / ctx.expected_input_bytes)
+            parts.append(
+                f"download={pct:4.1f}% ({format_bytes(snap.downloaded_bytes)}/{format_bytes(ctx.expected_input_bytes)})"
+            )
+        if snap.duration_seconds > 0:
+            parts.append(
+                f"media={format_duration(snap.encode.out_time_seconds)}/{format_duration(snap.duration_seconds)}"
+            )
+        if snap.encode.fps:
+            parts.append(f"fps={snap.encode.fps:.1f}")
+        if snap.encode.speed:
+            parts.append(f"speed={snap.encode.speed:.2f}x")
+        if snap.duration_seconds > 0 and snap.encode.speed > 0:
+            # All four renditions share one decode/encode pass, so one ETA
+            # covers the whole ABR ladder -- they finish together.
+            remaining_media = snap.duration_seconds - snap.encode.out_time_seconds
+            eta_seconds = max(0.0, remaining_media) / snap.encode.speed
+            parts.append(f"eta={format_duration(eta_seconds)}")
+
     parts.append(f"cost={format_cost(ctx.hourly_price, elapsed)}")
     logger.info("Progress: {}", "  ".join(parts))
 
@@ -65,6 +109,7 @@ def wait_for_job(
     hourly_price: float,
     expected_input_bytes: int | None,
     rental_started_at: float,
+    upload_staging_dir: Path | None = None,
 ) -> tuple[str, int]:
     deadline = time.time() + args.job_timeout
     ctx = JobContext(
@@ -78,12 +123,15 @@ def wait_for_job(
         # from when this monitoring loop happens to start -- provisioning,
         # bootstrap and download all run (and cost money) before this point.
         started_at=rental_started_at,
+        upload_staging_dir=upload_staging_dir,
+        upload_workers_total=args.upload_workers,
     )
     last_stage: str | None = None
     last_status: str | None = None
     last_log_tail = ""
     last_progress_logged_at = 0.0
     ssh_failure_started: float | None = None
+    upload_speed_state: dict = {}
 
     while time.time() < deadline:
         info = client.show_instance(instance_id)
@@ -147,7 +195,7 @@ def wait_for_job(
 
         now_monotonic = time.monotonic()
         if now_monotonic - last_progress_logged_at >= PROGRESS_LOG_INTERVAL_S:
-            _log_progress(ctx, snap)
+            _log_progress(ctx, snap, upload_speed_state)
             last_progress_logged_at = now_monotonic
 
         if snap.status.startswith("DONE:"):
@@ -166,7 +214,12 @@ def wait_for_job(
                 raise VastError(
                     f"Encoder job failed with exit code {rc}\n{logs.stdout}"
                 )
-            logger.success("Encoder job completed successfully")
+            # Not the final word: this is the remote script (encode + direct
+            # push to origin) exiting 0, not the pipeline being done -- origin
+            # still has to verify and atomically publish the staging
+            # directory locally. The real end-to-end "SUCCESS" is logged by
+            # pipeline.run() only after that step also succeeds.
+            logger.info("Remote job finished (encode + upload); verifying and publishing locally...")
             return host, port
 
         time.sleep(args.monitor_interval)

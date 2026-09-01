@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import shlex
 
 
 def build_onstart(job_script: str, failsafe_seconds: int, authorized_key: str) -> str:
-    payload = base64.b64encode(job_script.encode()).decode()
+    # gzip before base64: Vast's own create-instance API rejects a request
+    # once the (internal, undocumented-by-name) field this ends up in exceeds
+    # 16384 bytes ("Invalid args: ... len(args) > 16384 ..." from a real PUT
+    # /asks/<id>/ 400) -- plain base64 of the job script plus the outer
+    # bootstrap wrapper below (itself base64'd again, see the docstring on
+    # that step) blew past that. docs.vast.ai's own create-instance reference
+    # names gzip+base64 as the fix for a large onstart.
+    payload = base64.b64encode(gzip.compress(job_script.encode())).decode()
     quoted_key = shlex.quote(authorized_key.strip())
     # Vast's account-level SSH key injection has been observed to report a key
     # as "attached" (confirmed via its own API) while the container's actual
@@ -57,7 +65,7 @@ echo "=== Bootstrap started $(date -u +%FT%TZ) ==="
 # spawns `rsync --server` over the same ssh connection on the remote end).
 apt-get update -qq
 apt-get install -y --no-install-recommends rsync
-printf '%s' {payload!r} | base64 -d > /workspace/encode-job.sh
+printf '%s' {payload!r} | base64 -d | gunzip > /workspace/encode-job.sh
 chmod 700 /workspace/encode-job.sh
 echo "=== Starting encode job ==="
 nohup /workspace/encode-job.sh > /workspace/job.log 2>&1 &
@@ -65,5 +73,5 @@ trap - EXIT
 """
     # Vast may initially evaluate onstart through /bin/sh. Keep that outer command
     # POSIX-compatible and explicitly feed the real script to bash.
-    bootstrap_payload = base64.b64encode(bootstrap.encode()).decode()
-    return f"printf '%s' {shlex.quote(bootstrap_payload)} | base64 -d | /bin/bash"
+    bootstrap_payload = base64.b64encode(gzip.compress(bootstrap.encode())).decode()
+    return f"printf '%s' {shlex.quote(bootstrap_payload)} | base64 -d | gunzip | /bin/bash"

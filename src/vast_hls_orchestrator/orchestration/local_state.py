@@ -7,6 +7,7 @@ import fcntl
 import os
 import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -60,3 +61,20 @@ def recover_local_publish_state(args: argparse.Namespace) -> None:
         if path.is_symlink():
             raise VastError(f"Refusing symlinked stale staging path: {path}")
         shutil.rmtree(path, ignore_errors=True)
+
+
+def prepare_staging_dir(video_dir: Path, job_token: str) -> Path:
+    """Create a fresh `abr.staging.<job_token>` dir for Vast to push into.
+
+    Called early (before renting), not at publish time as before: the push
+    model needs somewhere to push into for the whole job's duration, not
+    just around a final pull. `job_token` (not `instance_id`) names it
+    because the instance doesn't exist yet at this point in the pipeline --
+    the same token is reused for the Vast create-instance `label`.
+    """
+    staging = video_dir / f"abr.staging.{job_token}"
+    if staging.is_symlink():
+        raise VastError(f"Refusing unsafe symlink staging path: {staging}")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging

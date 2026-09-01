@@ -84,6 +84,8 @@ printf 'META_STAGE='; cat /workspace/JOB_STAGE 2>/dev/null || echo bootstrap
 printf 'META_STATUS='; if [ -f /workspace/JOB_DONE ]; then printf 'DONE:'; cat /workspace/JOB_EXIT 2>/dev/null || echo 1; else echo RUNNING; fi
 printf 'META_DOWNLOADED='; echo $(( $(stat -c '%b' /workspace/input/source.mp4 2>/dev/null || echo 0) * 512 ))
 printf 'META_DURATION='; cat /workspace/input/duration.txt 2>/dev/null || echo 0
+printf 'META_UPLOAD_TOTAL_BYTES='; cat /workspace/upload/total_bytes 2>/dev/null || echo 0
+printf 'META_UPLOAD_WORKERS_DONE='; wc -l < /workspace/upload/done_workers 2>/dev/null || echo 0
 printf 'META_GPU='; nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null || true
 echo 'PROGRESS_BEGIN'
 cat /workspace/out/progress.txt 2>/dev/null || true
@@ -126,6 +128,16 @@ echo 'REMOTE_LOG_END'
         elif line.startswith("META_DURATION="):
             try:
                 snapshot.duration_seconds = float(line.split("=", 1)[1].strip() or 0)
+            except ValueError:
+                pass
+        elif line.startswith("META_UPLOAD_TOTAL_BYTES="):
+            try:
+                snapshot.upload_total_bytes = int(line.split("=", 1)[1].strip() or 0)
+            except ValueError:
+                pass
+        elif line.startswith("META_UPLOAD_WORKERS_DONE="):
+            try:
+                snapshot.upload_workers_done = int(line.split("=", 1)[1].strip() or 0)
             except ValueError:
                 pass
         elif line.startswith("META_GPU="):

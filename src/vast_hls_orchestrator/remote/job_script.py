@@ -15,6 +15,7 @@ Ti and above).
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 
 LADDER = [
     # name,  size,       bitrate, maxrate, bufsize, audio, cq
@@ -67,8 +68,157 @@ def _encode_outputs(out_dir: str, fifo: str) -> str:
     return " \\\n  ".join(blocks)
 
 
+def _embedded_upload_batching_source() -> str:
+    # Embedded verbatim into the uploading stage below (see
+    # _upload_stage_script) so there's exactly one source of truth for the
+    # batching algorithm -- unit-tested directly as plain Python in
+    # tests/test_upload_batching.py, and byte-identical to what runs here.
+    return Path(__file__).with_name("upload_batching.py").read_text(encoding="utf-8")
+
+
+def _upload_stage_script(
+    *,
+    staging_remote_path: str,
+    origin_ssh_user: str,
+    origin_ssh_host: str,
+    origin_ssh_port: int,
+    upload_workers: int,
+    upload_worker_stagger: float,
+    upload_retries: int,
+    rendition_list: str,
+) -> str:
+    quoted_dest = shlex.quote(f"{origin_ssh_user}@{origin_ssh_host}:{staging_remote_path}")
+    batching_source = _embedded_upload_batching_source()
+    return f"""
+set_stage uploading
+echo "=== Upload result to origin (direct push, up to {upload_workers} parallel workers) ==="
+
+UPLOAD_DIR=/workspace/upload
+rm -rf "$UPLOAD_DIR"
+mkdir -p "$UPLOAD_DIR"
+: > "$UPLOAD_DIR/done_workers"
+
+DEPLOY_KEY=/root/.ssh/vast_deploy_key
+ORIGIN_KNOWN_HOSTS=/root/.ssh/known_hosts_origin
+: > "$ORIGIN_KNOWN_HOSTS"
+ORIGIN_SSH_OPTS="-i $DEPLOY_KEY -p {origin_ssh_port} -c aes128-gcm@openssh.com -o Compression=no -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$ORIGIN_KNOWN_HOSTS"
+ORIGIN_DEST={quoted_dest}
+
+find "$OUT" -name 'segment_*.ts' -type f -printf '%s %P\\n' > "$UPLOAD_DIR/manifest.txt"
+segment_count=$(wc -l < "$UPLOAD_DIR/manifest.txt")
+num_workers={upload_workers}
+if [ "$segment_count" -lt "$num_workers" ]; then
+  num_workers=$segment_count
+fi
+if [ "$num_workers" -lt 1 ]; then
+  num_workers=1
+fi
+
+cat > "$UPLOAD_DIR/upload_batching.py" <<'UPLOAD_BATCHING_PY_EOF'
+{batching_source}UPLOAD_BATCHING_PY_EOF
+python3 "$UPLOAD_DIR/upload_batching.py" "$num_workers" "$UPLOAD_DIR" < "$UPLOAD_DIR/manifest.txt"
+
+playlist_bytes=0
+for q in {rendition_list}; do
+  playlist_bytes=$((playlist_bytes + $(stat -c '%s' "$OUT/$q/index.m3u8")))
+done
+master_bytes=$(stat -c '%s' "$OUT/master.m3u8")
+segment_bytes=$(cat "$UPLOAD_DIR/segment_total_bytes")
+echo $((segment_bytes + playlist_bytes + master_bytes)) > "$UPLOAD_DIR/total_bytes"
+
+upload_batch() {{
+  idx="$1"
+  batch="$UPLOAD_DIR/batch_$idx.list"
+  log="$UPLOAD_DIR/worker_$idx.log"
+  : > "$log"
+  if [ ! -s "$batch" ]; then
+    echo "$idx" >> "$UPLOAD_DIR/done_workers"
+    return 0
+  fi
+  attempt=1
+  while [ "$attempt" -le {upload_retries} ]; do
+    if rsync -a --whole-file --partial --partial-dir=.rsync-partial \\
+        --files-from="$batch" -e "ssh $ORIGIN_SSH_OPTS" \\
+        "$OUT/" "$ORIGIN_DEST/" >> "$log" 2>&1; then
+      echo "$idx" >> "$UPLOAD_DIR/done_workers"
+      return 0
+    fi
+    echo "batch $idx attempt $attempt failed" >> "$log"
+    sleep_s=$((2 ** attempt)); [ "$sleep_s" -gt 10 ] && sleep_s=10
+    sleep "$sleep_s"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}}
+
+echo "=== Pushing batched segments ($num_workers active workers) ==="
+pids=()
+for i in $(seq 0 $((num_workers - 1))); do
+  upload_batch "$i" &
+  pids[$i]=$!
+  sleep {upload_worker_stagger}
+done
+
+upload_failed=0
+for i in "${{!pids[@]}}"; do
+  if ! wait "${{pids[$i]}}"; then
+    echo "Upload batch $i failed after {upload_retries} attempts" >&2
+    echo "--- worker_$i.log tail ---" >&2
+    tail -n 100 "$UPLOAD_DIR/worker_$i.log" >&2 2>/dev/null || true
+    upload_failed=1
+  fi
+done
+if [ "$upload_failed" -ne 0 ]; then
+  echo "Upload failed: one or more segment batches did not succeed after retries" >&2
+  exit 30
+fi
+
+push_file() {{
+  src="$1"
+  dest_rel="$2"
+  attempt=1
+  while [ "$attempt" -le {upload_retries} ]; do
+    if rsync -a --whole-file -e "ssh $ORIGIN_SSH_OPTS" "$src" "$ORIGIN_DEST/$dest_rel" >> "$UPLOAD_DIR/playlists.log" 2>&1; then
+      return 0
+    fi
+    sleep_s=$((2 ** attempt)); [ "$sleep_s" -gt 10 ] && sleep_s=10
+    sleep "$sleep_s"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}}
+
+echo "=== Pushing rendition playlists ==="
+for q in {rendition_list}; do
+  if ! push_file "$OUT/$q/index.m3u8" "$q/index.m3u8"; then
+    echo "Failed to upload $q/index.m3u8" >&2
+    tail -n 100 "$UPLOAD_DIR/playlists.log" >&2 2>/dev/null || true
+    exit 31
+  fi
+done
+
+echo "=== Pushing master playlist (as master.m3u8.tmp -- published atomically by origin) ==="
+if ! push_file "$OUT/master.m3u8" "master.m3u8.tmp"; then
+  echo "Failed to upload master.m3u8" >&2
+  tail -n 100 "$UPLOAD_DIR/playlists.log" >&2 2>/dev/null || true
+  exit 32
+fi
+
+echo "=== Upload complete ==="
+"""
+
+
 def build_job_script(
-    source_url: str, expected_input_bytes: int | None = None
+    source_url: str,
+    expected_input_bytes: int | None,
+    *,
+    staging_remote_path: str,
+    origin_ssh_user: str,
+    origin_ssh_host: str,
+    origin_ssh_port: int,
+    upload_workers: int,
+    upload_worker_stagger: float,
+    upload_retries: int,
 ) -> str:
     quoted_url = shlex.quote(source_url)
     initial_required = int((expected_input_bytes or 0) * 1.05 + 2_147_483_648)
@@ -93,9 +243,34 @@ set_stage() {{
   printf '[%s] STAGE: %s\n' "$(date -u +%FT%TZ)" "$1"
 }}
 
+# Encode-stage process handles, read by finish() below. Declared here (empty)
+# so `set -u` doesn't choke if finish() runs before the encode stage ever
+# starts (e.g. a download/preflight failure) -- the encode stage overwrites
+# these with real PIDs once it actually starts ffmpeg/the progress relay.
+ffmpeg_pid=""
+relay_pid=""
+
+# The one EXIT trap for the whole job, from here to the very end -- it must
+# never be replaced or cleared by anything downstream (e.g. during the
+# encode stage), or a successful run stops short of ever writing JOB_EXIT/
+# JOB_DONE and the orchestrator polls a stage that never advances again.
 finish() {{
   rc=$?
   trap - EXIT INT TERM
+  # If we're exiting while the encode was still in flight (SIGINT/SIGTERM
+  # during `wait "$ffmpeg_pid"` below), the encode stage's own explicit
+  # cleanup after that wait never got to run -- do it here so a killed job
+  # doesn't leave ffmpeg/the relay running or the fifo behind.
+  if [ -n "$ffmpeg_pid" ]; then kill -TERM "$ffmpeg_pid" 2>/dev/null || true; fi
+  if [ -n "$relay_pid" ]; then
+    kill -TERM "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+  fi
+  rm -f "$OUT/progress.fifo"
+  # Defense-in-depth: the deploy key (see the uploading stage below) is also
+  # gone once the instance is destroyed shortly after this job exits either
+  # way, but there's no reason to leave it sitting on disk in the meantime.
+  rm -f /root/.ssh/vast_deploy_key
   printf '%s\n' "$rc" > "$STATUS.tmp.$$"
   mv -f "$STATUS.tmp.$$" "$STATUS"
   if [ "$rc" -eq 0 ]; then
@@ -185,16 +360,6 @@ fifo="$OUT/progress.fifo"
 rm -f "$fifo"
 mkfifo "$fifo"
 atomic_progress_relay "$fifo" "$OUT/progress.txt" & relay_pid=$!
-ffmpeg_pid=""
-cleanup_encode() {{
-  if [ -n "$ffmpeg_pid" ]; then kill -TERM "$ffmpeg_pid" 2>/dev/null || true; fi
-  kill -TERM "$relay_pid" 2>/dev/null || true
-  wait "$relay_pid" 2>/dev/null || true
-  rm -f "$fifo"
-}}
-trap cleanup_encode EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 echo "=== Start ABR encode (single NVDEC decode, GPU-side split into {len(LADDER)} branches) ==="
 ffmpeg -y -hide_banner -nostats -stats_period 1 \\
@@ -209,11 +374,12 @@ rc=$?
 # Terminate the relay rather than passively waiting on it: if ffmpeg died
 # before ever opening the fifo for writing (e.g. a bad filter graph caught
 # immediately), the relay is still blocked reading from it and would
-# otherwise hang here forever instead of the job actually failing.
+# otherwise hang here forever instead of the job actually failing. finish()
+# (the single EXIT trap for the whole job, still active here) does the same
+# cleanup defensively if a signal interrupts the `wait` above instead.
 kill -TERM "$relay_pid" 2>/dev/null || true
 wait "$relay_pid" 2>/dev/null || true
 set -e
-trap - EXIT INT TERM
 rm -f "$fifo"
 
 if [ "$rc" -ne 0 ]; then
@@ -247,4 +413,13 @@ done
 mv -f "$OUT/master.m3u8.tmp" "$OUT/master.m3u8"
 echo "=== Encoding complete ==="
 du -sh "$OUT"
-"""
+{_upload_stage_script(
+    staging_remote_path=staging_remote_path,
+    origin_ssh_user=origin_ssh_user,
+    origin_ssh_host=origin_ssh_host,
+    origin_ssh_port=origin_ssh_port,
+    upload_workers=upload_workers,
+    upload_worker_stagger=upload_worker_stagger,
+    upload_retries=upload_retries,
+    rendition_list=rendition_list,
+)}"""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 from pathlib import Path
 
@@ -100,7 +101,59 @@ def parse_args() -> argparse.Namespace:
         "--rsync-retries",
         type=int,
         default=4,
-        help="Resumable rsync transfer attempts",
+        help=(
+            "Resumable transfer attempts -- for a single upload batch, not "
+            "the whole transfer (each of --upload-workers batches gets its "
+            "own retry budget; a lagging batch never forces re-sending "
+            "already-succeeded ones)"
+        ),
+    )
+    parser.add_argument(
+        "--origin-ssh-host",
+        required=True,
+        help=(
+            "This origin's own SSH-reachable address, for the Vast instance to "
+            "push the finished HLS result to directly (bypassing Vast's "
+            "sshN.vast.ai relay, which throttles the bulk transfer). Cannot be "
+            "auto-discovered (NAT, multiple interfaces, DNS name, non-standard "
+            "port are all possible) -- supply whatever address actually reaches "
+            "this machine from the public internet."
+        ),
+    )
+    parser.add_argument(
+        "--origin-ssh-port", type=int, default=22, help="Port for --origin-ssh-host"
+    )
+    parser.add_argument(
+        "--origin-ssh-user",
+        default=getpass.getuser(),
+        help=(
+            "OS user on this origin machine that Vast pushes as (default: the "
+            "same user running this orchestrator, since it already needs write "
+            "access to --origin-root). A dedicated restricted deploy user is a "
+            "valid hardening step -- see README -- but isn't required"
+        ),
+    )
+    parser.add_argument(
+        "--origin-authorized-keys",
+        type=Path,
+        default=Path.home() / ".ssh" / "authorized_keys",
+        help="Where the ephemeral per-job deploy public key is appended/removed",
+    )
+    parser.add_argument(
+        "--upload-workers",
+        type=int,
+        default=16,
+        help="Parallel rsync push workers for the result transfer (1-64)",
+    )
+    parser.add_argument(
+        "--upload-worker-stagger",
+        type=float,
+        default=0.5,
+        help=(
+            "Seconds between starting each upload worker -- staggers past "
+            "origin sshd's MaxStartups, which otherwise resets some of "
+            "--upload-workers connections started simultaneously"
+        ),
     )
     parser.add_argument(
         "--dry-run",

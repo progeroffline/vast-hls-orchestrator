@@ -38,15 +38,15 @@ Temporary Vast.ai NVIDIA instance
   │
   │  2. aria2 загружает публичный source MP4 с origin
   │  3. один NVDEC decode → GPU split → 4× scale_cuda → 4× NVENC → 4 HLS rendition
-  │
-  ▲  4. Origin сам подключается по SSH и делает rsync pull
+  │  4. instance сам push'ит результат на origin: до 16 параллельных staggered
+  │     rsync-воркеров с ephemeral deploy-ключом → staging-каталог
   │
 Binary Racks staging → atomic publish /video/<video_id>/abr/
   │
   └─ 5. DELETE Vast instance в обязательном finally
 ```
 
-Vast instance никогда не подключается обратно к origin по административному SSH и не получает приватный ключ Binary Racks. Направление передачи результата — **pull с origin**, а не push с Vast.
+Vast instance никогда не получает приватный административный ключ Binary Racks и не может выполнять на origin произвольные команды. Направление передачи результата — **push с Vast**, а не pull с origin: bulk-данные (сегменты, playlists, master) идут не через Vast'овский `sshN.vast.ai` relay (control-plane канал, ограниченный по скорости), а напрямую наружу с самого instance, с отдельным ephemeral deploy-ключом (см. [Доступы и модель безопасности](#доступы-и-модель-безопасности)), у которого нет прав ни на что, кроме file-transfer в один конкретный staging-каталог.
 
 Пакет: [`src/vast_hls_orchestrator/`](src/vast_hls_orchestrator/) (см. [Структура проекта](#структура-проекта)).
 
@@ -73,19 +73,21 @@ src/vast_hls_orchestrator/
 │   └── offers.py                  # оценка размера source, ranking, поиск+таблица offers
 │
 ├── remote/                    # всё, что выполняется на/через временный Vast instance
-│   ├── job_script.py             # bash-скрипт: download, GPU preflight, ABR encode (split+NVENC)
+│   ├── job_script.py             # bash-скрипт: download, GPU preflight, ABR encode, upload-стадия
+│   ├── upload_batching.py          # LPT size-balanced батчинг сегментов; embedded в job_script.py
 │   ├── onstart.py                  # bootstrap (`onstart`): запись SSH-ключа, watchdog, запуск job
 │   ├── ssh.py                       # non-interactive ssh_run/wait_for_ssh (spinner, один endpoint)
-│   └── snapshot.py                   # парсинг FFmpeg `-progress` и nvidia-smi по SSH
+│   └── snapshot.py                   # парсинг FFmpeg `-progress`, upload-статуса и nvidia-smi по SSH
 │
 ├── ui/
 │   └── formatting.py            # format_duration/format_bytes/format_cost — общие форматтеры лога
 │
 └── orchestration/              # жизненный цикл instance и результата
     ├── provisioning.py            # rent_instance, wait_for_running, read_public_key
+    ├── deploy_key.py                # ephemeral per-job deploy-ключ для push Vast → origin
     ├── job_monitor.py               # wait_for_job: SSH-поллинг + периодические строки прогресса
-    ├── publish.py                    # atomic_exchange_dirs, rsync_results (plain subprocess)
-    ├── local_state.py                 # file lock на video_id, recovery прерванного publish
+    ├── publish.py                    # atomic_exchange_dirs, finalize_push_publish (только локально)
+    ├── local_state.py                 # file lock, prepare_staging_dir, recovery прерванного publish
     └── diagnostics.py                  # tail удалённых логов при сбое
 ```
 
@@ -93,20 +95,20 @@ src/vast_hls_orchestrator/
 
 ## Полный жизненный цикл job
 
-1. Orchestrator проверяет аргументы, URL, `video_id`, API key и локальный SSH key.
-2. Для обычного запуска получает эксклюзивный file lock для конкретного `video_id`.
-3. Выполняет `HEAD` source URL, если сервер поддерживает его, и получает ожидаемый размер MP4.
-4. Запрашивает у Vast.ai подходящие offers по allow-list GPU (по умолчанию — только RTX 4080).
-5. Объединяет, дедуплицирует и ранжирует offers по ожидаемой полной стоимости job.
-6. Принимает лучший доступный offer через Vast API и получает `instance_id`.
-7. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint; если SSH так и не поднялся, делает `reboot` инстанса (это заново прогоняет `onstart` и пересобирает `authorized_keys` с нуля) и повторяет ожидание — до нескольких таких циклов подряд, прежде чем считать job проваленным (см. [SSH-ключ пишется в контейнер напрямую](#ssh-ключ-пишется-в-контейнер-напрямую-а-не-через-аккаунтную-инъекцию-vast)).
-8. Vast выполняет переданный `onstart`: запускает watchdog, устанавливает пакеты и стартует remote encode job.
-9. Origin через SSH опрашивает stage, download size, GPU telemetry, progress-файлы и tails логов.
-10. Remote job скачивает source, проверяет диск и GPU pipeline, затем одним FFmpeg-процессом (общий decode, GPU-side split) кодирует все четыре rendition.
-11. После успеха всех rendition создаётся `master.m3u8` и проверяется структура результата.
-12. Origin делает resumable `rsync pull` в staging-каталог.
-13. Staging валидируется, служебные progress/log-файлы удаляются, HLS публикуется.
-14. Независимо от результата Python `finally` вызывает DELETE instance.
+1. Orchestrator проверяет аргументы, URL, `video_id`, API key, локальный SSH key и `--origin-ssh-host`.
+2. Для обычного запуска получает эксклюзивный file lock для конкретного `video_id`, затем сметает просроченные записи предыдущих deploy-ключей в `authorized_keys` (backstop на случай `kill -9` прошлого запуска — см. [Доступы и модель безопасности](#доступы-и-модель-безопасности)).
+3. Генерирует `job_token` (тот же паттерн, что раньше был у `create_label`) и создаёт staging-каталог `abr.staging.<job_token>` заранее — instance должен иметь куда push'ить весь job, а не только в конце. Тут же генерирует ephemeral deploy-keypair и добавляет публичную половину в локальный `authorized_keys`.
+4. Выполняет `HEAD` source URL, если сервер поддерживает его, и получает ожидаемый размер MP4.
+5. Запрашивает у Vast.ai подходящие offers по allow-list GPU (по умолчанию — только RTX 4080).
+6. Объединяет, дедуплицирует и ранжирует offers по ожидаемой полной стоимости job.
+7. Принимает лучший доступный offer через Vast API и получает `instance_id`.
+8. Ждёт `actual_status=running`, затем отдельно ждёт появления рабочего SSH endpoint; если SSH так и не поднялся, делает `reboot` инстанса и повторяет ожидание — до нескольких таких циклов подряд, прежде чем считать job проваленным (см. [SSH-ключ пишется в контейнер напрямую](#ssh-ключ-пишется-в-контейнер-напрямую-а-не-через-аккаунтную-инъекцию-vast)).
+9. Как только admin SSH-канал подтверждён живым, origin пушит приватную половину deploy-ключа на instance тем же каналом (только через stdin, не через `onstart` и не в аргументах команды).
+10. Vast выполняет переданный `onstart`: запускает watchdog, устанавливает `rsync` и стартует remote encode job.
+11. Origin через SSH (relay-эндпоинт) опрашивает stage, download size, GPU telemetry, encode/upload progress и tails логов; сам upload progress считает по факту роста staging-каталога на своей стороне, без дополнительных SSH round-trip'ов.
+12. Remote job скачивает source, проверяет диск и GPU pipeline, затем одним FFmpeg-процессом (общий decode, GPU-side split) кодирует все четыре rendition, после чего сам (`stage=uploading`) пушит результат напрямую на origin — см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin).
+13. Origin делает `staging/master.m3u8.tmp → staging/master.m3u8` и атомарно публикует staging.
+14. Независимо от результата Python `finally` вызывает DELETE instance и убирает deploy public key из локального `authorized_keys`.
 
 ## Доступы и модель безопасности
 
@@ -128,6 +130,16 @@ src/vast_hls_orchestrator/
 ### `CONTAINER_API_KEY`
 
 Vast автоматически внедряет внутрь instance ограниченный ключ `CONTAINER_API_KEY` и `CONTAINER_ID`. Этот ключ может управлять только данным instance и используется исключительно failsafe-watchdog для self-destroy. Это не `VAST_API_KEY` пользователя и не credential origin.
+
+### Ephemeral deploy-ключ `/root/.ssh/vast_deploy_key` (Vast → origin, только для push)
+
+Отдельный, специально урезанный по privilege ключ — направление доверия здесь обратное по сравнению с админским `/root/.ssh/vast_encoder` выше: он даёт **Vast'у** возможность что-то сделать **на origin**, а не наоборот. Именно поэтому его жизненный цикл спроектирован так, чтобы урезать возможный ущерб на каждом шаге:
+
+- **Генерируется на origin**, не на Vast: `ssh-keygen -t ed25519` во временный файл, оба байта сразу читаются в память, временный файл удаляется. Приватная половина никогда не проходит через `onstart`/Vast API — она передаётся на instance напрямую через уже установленный admin SSH-канал, **только через stdin**, никогда не как аргумент команды и никогда не логируется (`orchestration/deploy_key.py`).
+- **Публичная половина** дописывается в `--origin-authorized-keys` (по умолчанию — `~/.ssh/authorized_keys` того же OS-пользователя, что запускает orchestrator, поскольку он уже имеет права писать в `--origin-root`; можно указать выделенного ограниченного deploy-пользователя явно — это не обязательно, но рекомендуется как дальнейшее укрепление) под уникальным тегом `vast-deploy-<job_token>-<unix_ts>`, под `flock`.
+- **Живёт только во время job**: на Vast — до `finish()` в конце job_script.py (`rm -f /root/.ssh/vast_deploy_key`; полная гарантия — DELETE instance в `finally`); на origin — публичная запись удаляется в `finally` пайплайна безусловно.
+- **Backstop на случай `kill -9` orchestrator'а**: `finally` тогда не выполнится, а origin — персистентный сервер, так что просроченная запись иначе осталась бы навсегда. При каждом старте (рядом с `recover_local_publish_state`) `deploy_key.sweep_stale_keys()` вычищает записи со своим же тегом старше `STALE_DEPLOY_KEY_MAX_AGE_S` (24 часа) — никогда не трогает чужие строки в `authorized_keys`.
+- **Урезан по возможностям, не только по времени жизни**: используется только для `rsync`/file-transfer на один конкретный staging-каталог, никогда для выполнения произвольных команд на origin (см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin)). SSH `command=`-форсинг (жёстко ограничить ключ конкретно на `rsync --server ...`) **не реализован** в этой версии — hand-crafting точного разрешённого rsync-server invocation достаточно хрупок, чтобы сломать легитимные transfer'ы при малейшей неточности; это осознанный компромисс, а не недосмотр, и разумный шаг для дальнейшего укрепления, если понадобится.
 
 ### Source URL
 
@@ -181,9 +193,11 @@ install -d -m 755 /var/www/html/video
 - Linux и Python 3.10+;
 - [uv](https://docs.astral.sh/uv/) для управления зависимостями и запуска;
 - исходящий HTTPS к `console.vast.ai`;
-- исходящий SSH к endpoint, выданному Vast;
-- `rsync` и OpenSSH client;
-- права на `/var/www/html/video`;
+- исходящий SSH к endpoint, выданному Vast (control-plane: мониторинг, SSH-recovery);
+- **входящий** SSH на `--origin-ssh-port` (по умолчанию 22), доступный с временного Vast instance — сюда instance пушит результат напрямую, в обход Vast relay;
+- sshd `MaxStartups`/`MaxSessions` должны допускать до `--upload-workers` (по умолчанию 16) параллельных подключений; при дефолтном stagger в 0.5s между стартами это уже проверено на стандартном `MaxStartups 10:30:100`, но если он занижен на конкретном хосте — либо ослабьте его, либо увеличьте `--upload-worker-stagger`. Sshd-конфигурацию Binary Racks orchestrator не трогает автоматически;
+- `rsync` и OpenSSH client (и server — для upload push);
+- права на `/var/www/html/video` и на редактирование `--origin-authorized-keys` (по умолчанию `~/.ssh/authorized_keys` пользователя, запускающего orchestrator);
 - Python packages (ставятся через uv): Requests, Rich и Loguru.
 
 ### Vast host/offer
@@ -251,7 +265,8 @@ export VAST_API_KEY='...'
 uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
-  --ssh-key /root/.ssh/vast_encoder
+  --ssh-key /root/.ssh/vast_encoder \
+  --origin-ssh-host origin.example.com
 ```
 
 Расширенные диагностические сообщения:
@@ -261,6 +276,7 @@ uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --ssh-key /root/.ssh/vast_encoder \
+  --origin-ssh-host origin.example.com \
   --verbose
 ```
 
@@ -271,10 +287,11 @@ uv run vast-hls-orchestrator \
   --video-id test \
   --source-url https://origin.example.com/video/test.mp4 \
   --ssh-key /root/.ssh/vast_encoder \
+  --origin-ssh-host origin.example.com \
   --dry-run
 ```
 
-`--ssh-key` — обязательный параметр CLI при любом запуске (в том числе `--dry-run`, argparse проверяет его наличие независимо от режима), но сам файл ключа для dry-run не читается и не обязан существовать. Dry-run требует `VAST_API_KEY` и ничего не создаёт в Vast.
+`--ssh-key` и `--origin-ssh-host` — обязательные параметры CLI при любом запуске (в том числе `--dry-run`, argparse проверяет их наличие независимо от режима), но сам файл ключа и доступность origin-адреса для dry-run не проверяются. Dry-run требует `VAST_API_KEY` и ничего не создаёт в Vast.
 
 ## Поиск, фильтрация и рейтинг машин
 
@@ -302,7 +319,7 @@ Offers сортируются лексикографически по следу
 2. минимальная `estimated_cost`;
 3. минимальная почасовая `dph_total`;
 4. максимальная download bandwidth (`inet_down`) — обязательный минимум 500 Mbps уже задан фильтром поиска, здесь это тай-брейкер в пользу более быстрого канала (1 Gbps+ предпочтительнее);
-5. максимальная upload bandwidth (`inet_up`) — тот же принцип: 500 Mbps гарантирован фильтром, из прошедших фильтр предпочитается более быстрый — именно с upload-канала instance origin потом делает `rsync pull` готового ABR HLS;
+5. максимальная upload bandwidth (`inet_up`) — тот же принцип: 500 Mbps гарантирован фильтром, из прошедших фильтр предпочитается более быстрый — именно через upload-канал instance пушит готовый ABR HLS напрямую на origin (см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin));
 6. максимальная disk bandwidth.
 
 В terminal выводится таблица пяти лучших кандидатов с отдельной колонкой `NVENC`. Для аренды последовательно рассматриваются первые десять: если offer уже занят или вернул `no_compatible_tag`, берётся следующий — но только среди `RTX 4080`, без расширения на другую модель GPU (см. [Vast host/offer](#vast-hostoffer)).
@@ -324,7 +341,7 @@ env:          -e NVIDIA_DRIVER_CAPABILITIES=all -e NVIDIA_VISIBLE_DEVICES=all
 
 ### Docker image: `progeroffline/vast-transcoder`
 
-По умолчанию (`--image`, переопределяется через `VAST_IMAGE`) используется собственный образ проекта — [`progeroffline/vast-transcoder`](https://hub.docker.com/r/progeroffline/vast-transcoder), тот же, что зарегистрирован в приватном Vast-шаблоне ["HLS Transcoder"](https://cloud.vast.ai/?template_id=adf45ab182295032e068198e37c4788e) (`hash_id=adf45ab182295032e068198e37c4788e`, получен через `GET /api/v0/template/?select_filters={"hash_id":{"eq":...}}`). База — `nvidia/cuda:12.6.3` Ubuntu 24.04, поверх неё собран свой `ffmpeg` (в `/opt/ffmpeg/bin`, уже в `PATH` образа) с `h264_nvenc`/`hevc_nvenc`/`av1_nvenc`, `cuvid`-декодерами и `scale_cuda`, плюс `aria2c`, `curl`, `ca-certificates`. Поэтому `onstart` (см. [Bootstrap и remote job](#bootstrap-и-remote-job)) больше не ставит `ffmpeg`/`aria2`/`curl`/`ca-certificates` через `apt-get` — только `rsync`, которого в образе нет (он нужен и на remote-стороне: `rsync pull` с origin поднимает `rsync --server` через тот же SSH-канал на удалённом конце).
+По умолчанию (`--image`, переопределяется через `VAST_IMAGE`) используется собственный образ проекта — [`progeroffline/vast-transcoder`](https://hub.docker.com/r/progeroffline/vast-transcoder), тот же, что зарегистрирован в приватном Vast-шаблоне ["HLS Transcoder"](https://cloud.vast.ai/?template_id=adf45ab182295032e068198e37c4788e) (`hash_id=adf45ab182295032e068198e37c4788e`, получен через `GET /api/v0/template/?select_filters={"hash_id":{"eq":...}}`). База — `nvidia/cuda:12.6.3` Ubuntu 24.04, поверх неё собран свой `ffmpeg` (в `/opt/ffmpeg/bin`, уже в `PATH` образа) с `h264_nvenc`/`hevc_nvenc`/`av1_nvenc`, `cuvid`-декодерами и `scale_cuda`, плюс `aria2c`, `curl`, `ca-certificates`. Поэтому `onstart` (см. [Bootstrap и remote job](#bootstrap-и-remote-job)) больше не ставит `ffmpeg`/`aria2`/`curl`/`ca-certificates` через `apt-get` — только `rsync`, которого в образе нет — а remote job теперь сам запускает `rsync`-клиент, пушащий результат наружу на origin (см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin)), так что без него upload-стадия не сможет стартовать вообще.
 
 Образ не заменяет и не отменяет запись SSH-ключа через `onstart` (см. ниже) — свой `authorized_keys` он не пишет и не знает публичного ключа заранее, эта часть архитектуры не изменилась.
 
@@ -378,12 +395,14 @@ Bootstrap:
 4. запускает self-destroy watchdog;
 5. выполняет `apt-get update`;
 6. устанавливает `rsync` (единственный отсутствующий в образе бинарь — `ffmpeg`, `aria2c`, `curl`, `ca-certificates` уже в `progeroffline/vast-transcoder`, см. [Docker image](#docker-image-progeroffline-vast-transcoder));
-7. декодирует `/workspace/encode-job.sh` из Base64;
+7. декодирует `/workspace/encode-job.sh` из gzip+Base64;
 8. запускает job через `nohup`, вывод направляет в `/workspace/job.log`.
 
-Base64 здесь не является шифрованием. Он нужен только для надёжной передачи многострочного Bash через JSON/API без разрушения quoting. Secrets в payload отсутствуют.
+И сам `encode-job.sh` (внутренний payload), и весь bootstrap-скрипт целиком (внешняя обёртка, которую Vast получает как значение `onstart`) сжимаются gzip перед Base64 — на remote-стороне соответственно `base64 -d | gunzip`. Base64 здесь не является шифрованием: он нужен только для надёжной передачи многострочного Bash через JSON/API без разрушения quoting; secrets в payload отсутствуют. gzip — не про секретность, а про размер: `PUT /api/v0/asks/<id>/` реально отклоняет запрос с `HTTP 400 "Invalid args: ... len(args) > 16384"`, если результирующий onstart-payload превышает этот лимит (воспроизведено на реальном API), а обычный Base64 без сжатия для этого job-скрипта уже вплотную подходит к границе. `docs.vast.ai` сам называет gzip+Base64 решением для большого `onstart`.
 
 Если bootstrap падает до запуска job, trap всё равно создаёт `JOB_EXIT`, переводит stage в `bootstrap-failed` и создаёт `JOB_DONE`, поэтому origin не ждёт до полного timeout.
+
+Ephemeral deploy-ключ (для upload-стадии, см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin)) в этот `onstart`-payload не входит — origin пушит его отдельно, уже после того как admin SSH подтверждён живым (`orchestration/deploy_key.py::install_private_key_on_remote`), напрямую в `/root/.ssh/vast_deploy_key` через stdin того же SSH-канала. Так приватный материал не проходит через Vast API вообще, даже в сжатом виде.
 
 ## Загрузка исходного видео
 
@@ -516,7 +535,15 @@ Progress: stage=encoding  download=100.0% (9.4 GiB/9.4 GiB)  media=00:02:14/00:1
 
 `cost` — это `цена offer ($/h) × время с момента фактической аренды instance / 3600`, то есть накопленные расходы на **этот** instance к текущему моменту (а не оценка на весь job). Отсчёт времени идёт с момента успешного создания instance (`rent_instance`), а не с начала мониторинга encoding — provisioning, bootstrap и download тоже платные и должны входить в сумму. При завершении job (успех, `Ctrl+C` или сбой) тот же расчёт печатается как `Total cost` — оплата идёт независимо от результата, поэтому строка появляется во всех трёх случаях.
 
-Переходы стадии (`stage=download` → `stage=encoding` → ...) и статуса логируются сразу, отдельной строкой, а не только в периодической сводке.
+На стадии `stage=uploading` строка выглядит иначе:
+
+```text
+Progress: stage=uploading  uploaded=57.4% (5.8 GiB/10.1 GiB)  speed=27.1 MiB/s  workers=11/16  eta=00:02:45  cost=$0.0891
+```
+
+`uploaded` origin считает **сам**, локально, обходом staging-каталога (`orchestration/publish.py::staging_bytes_on_disk`, реальные disk blocks, а не apparent size — тот же принцип, что и у `download=` при скачивании source) — никакого дополнительного SSH round-trip на каждый байт не нужно, поскольку instance пушит именно в тот каталог, которым origin уже владеет локально. По SSH-polling (тот же relay-эндпоинт, что и раньше) забираются только две дешёвые вещи, которые origin сам узнать не может: общий ожидаемый объём (`total_bytes`, посчитан remote-стороной сразу после batching) и число уже завершившихся workers. `speed`/`eta` считаются по двум последовательным замерам `uploaded` между печатями строки (раз в те же 10 секунд). Проценты, как и у `download=`, заклэмплены сверху в 100% — реальные disk blocks могут по тем же причинам (выравнивание по блокам ФС при параллельной записи) слегка превышать заявленный `total`.
+
+Переходы стадии (`stage=download` → `stage=encoding` → `stage=finalizing` → `stage=uploading` → ...) и статуса логируются сразу, отдельной строкой, а не только в периодической сводке. `SUCCESS Encoder job completed successfully` больше не печатается сразу после того, как remote script завершится (это означало только "encode+upload на стороне Vast прошли", а не "весь pipeline готов") — теперь это `INFO`-строка, а финальный `logger.success("SUCCESS")` печатается только после локального atomic publish на origin, то есть после того, как результат реально и безопасно доступен по итоговому URL.
 
 ### Loguru
 
@@ -532,37 +559,37 @@ API keys и private key contents не логируются.
 
 ## Получение и публикация результата
 
-После remote success Binary Racks выполняет:
+### Upload: direct parallel push (Vast → origin)
 
-```text
-rsync -a --partial --partial-dir=.rsync-partial --info=progress2
-```
+Раньше bulk-транспорт (`.ts`-сегменты, playlists, master) шёл через `rsync pull`: origin сам подключался к Vast (через relay `sshN.vast.ai` или, при доступности, `public_ipaddr` instance'а) и забирал `/workspace/out/` одним потоком — по факту ≈3.5–4 MiB/s. Прямой outbound push с самого instance при 16 параллельных потоках даёт на порядок больше (замерено отдельно: ≈28 MiB/s / ≈226 Mbps на 16 потоках против ≈3.5 MiB/s на одном). Поэтому transfer теперь идёт в обратную сторону — remote job сам пушит результат на origin, и relay остаётся только под control-plane (мониторинг, SSH-recovery), где пропускная способность не критична.
 
-Источник — `root@<vast-endpoint>:/workspace/out/`, назначение:
+После `finalizing` remote job (`remote/job_script.py`) переходит в `set_stage uploading` и делает следующее:
 
-```text
-/var/www/html/video/<video_id>/abr.staging.<instance_id>/
-```
+1. Строит манифест всех `.ts` сегментов (`find "$OUT" -name 'segment_*.ts' -printf '%s %P\n'`) — размер + относительный путь (`1080p/segment_00000.ts` и т.п.).
+2. Балансирует их по **суммарному байтовому размеру**, не по количеству файлов и не по одному worker'у на rendition (у renditions сильно разный размер — naive-разбиение оставило бы 1080p как одинокий медленный поток, пока остальные уже закончили). Алгоритм — greedy LPT (largest-first в самый лёгкий на данный момент batch), реализован как отдельный чистый модуль `remote/upload_batching.py::plan_batches()`, embedded в generated bash буквально (единственный источник истины, покрыт юнит-тестами напрямую как Python).
+3. Запускает до `--upload-workers` (по умолчанию 16) параллельных `rsync`-воркеров с задержкой `--upload-worker-stagger` (по умолчанию 0.5s) между стартами — 16 одновременных SSH-подключений упираются в `MaxStartups`/`MaxSessions` sshd на origin (`kex_exchange_identification: read: Connection reset by peer`), stagger снимает это без изменения sshd-конфигурации на origin.
+4. Каждый worker — `rsync -a --whole-file --partial --partial-dir=.rsync-partial --files-from=<batch>` с `Compression=no` (`.ts` уже сжат) и `-c aes128-gcm@openssh.com`. Неудачный batch повторяется независимо от остальных — до `--rsync-retries` попыток (тот же флаг, что раньше был у pull; семантика "resumable transfer attempts" не изменилась) с тем же backoff `min(2**attempt, 10)`, что и везде в проекте. Успешные batches не передаются повторно.
+5. После **всех** сегментов — 4 playlist (`<rendition>/index.m3u8`).
+6. Последним — `master.m3u8`, под именем **`master.m3u8.tmp`** в staging-каталоге (не `master.m3u8`).
+7. Если хоть один batch не прошёл после всех retries — `exit` с ненулевым кодом; `finish()` (единый EXIT trap, см. [Bootstrap и remote job](#bootstrap-и-remote-job)) корректно помечает `JOB_STAGE=failed`. Поскольку master пушится строго последним, при любом сбое раньше он физически не может оказаться на origin.
 
-При временном SSH/rsync failure выполняется до четырёх попыток. Staging не пересоздаётся между попытками, поэтому partial files используются для resume.
+Staging-каталог (`abr.staging.<job_token>`, где `job_token` — тот же токен, что и у `create_label`; создан origin'ом заранее, **до** аренды instance — `job_script.py` должен знать путь ещё на этапе сборки, а `instance_id` тогда ещё не существует) не публичен, пока не произойдёт atomic exchange ниже — клиент физически не может увидеть новый `master.m3u8`, у которого ещё нет части renditions.
 
-До публикации проверяются:
+После того как remote job завершился успешно (`JOB_DONE`/`JOB_EXIT=0`), origin (`orchestration/publish.py::finalize_push_publish`) **не делает никакого сетевого transfer'а** — он уже случился на стороне Vast. Origin только:
 
-- `master.m3u8`;
-- все четыре `index.m3u8`;
-- хотя бы один непустой `segment_*.ts` для каждого rendition.
-
-`ffmpeg.log` и `progress.txt` удаляются из staging и не становятся публичными.
+- проверяет `master.m3u8.tmp`, все четыре `index.m3u8`, хотя бы один непустой `segment_*.ts` на rendition;
+- локально переименовывает `staging/master.m3u8.tmp → staging/master.m3u8`;
+- делает существующий atomic publish (см. ниже) — не изменился.
 
 На Linux существующий `abr` и новый staging меняются местами одним `renameat2(RENAME_EXCHANGE)`. Старый `abr`, оказавшийся в staging, переносится в backup и удаляется. Если filesystem не поддерживает exchange, применяется совместимый fallback:
 
 ```text
-abr → abr.backup.<instance_id>
+abr → abr.backup.<job_token>
 staging → abr
 delete backup
 ```
 
-При старте следующего job orchestrator восстанавливает backup после прерванного publish и очищает stale staging/backup. Все rename выполняются внутри одного filesystem.
+При старте следующего job orchestrator восстанавливает backup после прерванного publish и очищает stale staging/backup (`abr.staging.*`/`abr.backup.*` — те же glob'ы, что и раньше, просто теперь под `job_token`, а не `instance_id`). Все rename выполняются внутри одного filesystem.
 
 Итоговый URL:
 
@@ -618,7 +645,7 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 - отсутствие NVENC/NVDEC/`scale_cuda`;
 - сбой ABR-процесса (единый decode+split+encode);
 - job timeout;
-- прерванный/resumable rsync;
+- сбой отдельного upload batch (retry только этого batch, независимо от остальных; persistent failure после всех попыток — весь job failed, master не публикуется);
 - неполный HLS result;
 - stale staging/backup;
 - параллельный job с тем же `video_id`.
@@ -647,7 +674,13 @@ Watchdog стартует до `apt-get`. После `--failsafe-seconds` он �
 | `--failsafe-seconds` | `14400` | Задержка self-destroy watchdog |
 | `--monitor-interval` | `1.5` | Частота SSH telemetry polling |
 | `--ssh-reconnect-timeout` | `180` | Допустимая длительность SSH outage |
-| `--rsync-retries` | `4` | Число resumable transfer attempts |
+| `--rsync-retries` | `4` | Число resumable transfer attempts на **каждый** upload batch независимо |
+| `--origin-ssh-host` | **обязателен** | SSH-адрес origin, доступный снаружи — куда Vast пушит результат напрямую. Автоопределения нет (NAT/несколько интерфейсов/DNS/нестандартный порт) |
+| `--origin-ssh-port` | `22` | Порт для `--origin-ssh-host` |
+| `--origin-ssh-user` | текущий OS-пользователь | От чьего имени Vast пушит на origin; можно указать выделенного ограниченного deploy-пользователя |
+| `--origin-authorized-keys` | `~/.ssh/authorized_keys` | Куда дописывается/удаляется ephemeral deploy public key |
+| `--upload-workers` | `16` | Параллельных rsync push-воркеров (1–64) |
+| `--upload-worker-stagger` | `0.5` | Секунд между стартом воркеров — иначе часть соединений может упасть под `MaxStartups` origin sshd |
 | `--gpus` | `RTX 4080` (см. [Vast host/offer](#vast-hostoffer)) | Разрешённые GPU names; без явного override — расширения на другую модель нет |
 | `--verbose` | off | DEBUG logging |
 | `--dry-run` | off | Только search/ranking, без аренды |
@@ -697,3 +730,5 @@ uv run vast-hls-orchestrator --help
 6. Контролируйте свободное место origin: remote disk проверяется автоматически, origin disk — ответственность оператора.
 7. Тестируйте HLS playback и nginx MIME types (`application/vnd.apple.mpegurl`, `video/mp2t`) после первого deploy.
 8. Перед изменением bitrate ladder или `--gpus` (allow-list сейчас — только `RTX 4080`, выбранная по прямому бенчмарку) прогоните тот же бенчмарк на новой карте/конфигурации, а не полагайтесь на теоретическое число NVENC-движков.
+9. Убедитесь, что `--origin-ssh-host` реально доступен снаружи (проверьте с любой внешней машины, не только с самого origin) — если Vast instance не сможет достучаться до него, upload-стадия будет проваливаться на каждой попытке, и job будет падать уже после (платного) encode.
+10. Для более строгой изоляции deploy-ключа заведите отдельного ограниченного OS-пользователя на origin (только права на конкретный `--origin-root`, без shell-доступа) и укажите его через `--origin-ssh-user`/`--origin-authorized-keys` — по умолчанию используется тот же пользователь, что запускает orchestrator, что проще для старта, но менее строго изолировано. SSH `command=`-форсинг под конкретный `rsync --server` в этой версии не реализован (см. [Ephemeral deploy-ключ](#ephemeral-deploy-ключ-rootsshvast_deploy_key-vast--origin-только-для-push)) — это следующий шаг усиления, если понадобится.
