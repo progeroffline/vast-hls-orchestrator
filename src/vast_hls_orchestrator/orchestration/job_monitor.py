@@ -11,12 +11,13 @@ from loguru import logger
 
 from ..core.constants import BAD_STATES
 from ..core.errors import VastError
-from ..core.models import JobContext, RemoteSnapshot
+from ..core.models import JobContext, RemoteSnapshot, SshEndpoint
 from ..orchestration.publish import staging_bytes_on_disk
 from ..remote.snapshot import fetch_remote_snapshot
 from ..remote.ssh import ssh_run
 from ..ui.formatting import format_bytes, format_cost, format_duration
 from ..vast_api.client import VastClient
+from .provisioning import ssh_endpoint_candidates
 
 # Print a progress summary at most this often, regardless of --monitor-interval,
 # so a fast poll cadence doesn't turn into log spam.
@@ -141,27 +142,43 @@ def wait_for_job(
         if state in BAD_STATES:
             raise VastError(f"Instance entered bad state during encoding: {state}")
 
-        new_host = str(info.get("ssh_host") or host)
-        try:
-            new_port = int(info.get("ssh_port") or port)
-        except (TypeError, ValueError):
-            new_port = port
-        if (new_host, new_port) != (host, port):
-            logger.warning(
-                "Vast changed SSH endpoint from {}:{} to {}:{}",
-                host,
-                port,
-                new_host,
-                new_port,
-            )
-            host, port = new_host, new_port
+        endpoints = ssh_endpoint_candidates(info)
+        # Keep a healthy current route first, but retain the other route as an
+        # immediate fallback. Crucially, never synthesize public_ipaddr:ssh_port.
+        if not any(
+            (endpoint.host, endpoint.port) == (host, port) for endpoint in endpoints
+        ):
+            endpoints.insert(0, SshEndpoint("current", host, port))
+        endpoints.sort(
+            key=lambda endpoint: (endpoint.host, endpoint.port) != (host, port)
+        )
+        snapshot_error: Exception | None = None
+        snap: RemoteSnapshot | None = None
+        for endpoint in endpoints:
+            try:
+                snap = fetch_remote_snapshot(args, endpoint.host, endpoint.port)
+            except (subprocess.TimeoutExpired, VastError, OSError) as exc:
+                snapshot_error = exc
+                logger.warning(
+                    "SSH monitoring via {} endpoint {}:{} failed; trying next route",
+                    endpoint.kind,
+                    endpoint.host,
+                    endpoint.port,
+                )
+                continue
+            if (endpoint.host, endpoint.port) != (host, port):
+                logger.warning(
+                    "Switching SSH monitoring endpoint from {}:{} to {} {}:{}",
+                    host,
+                    port,
+                    endpoint.kind,
+                    endpoint.host,
+                    endpoint.port,
+                )
+                host, port = endpoint.host, endpoint.port
+            break
 
-        try:
-            snap = fetch_remote_snapshot(args, host, port)
-            if ssh_failure_started is not None:
-                logger.success("SSH monitoring connection recovered")
-            ssh_failure_started = None
-        except (subprocess.TimeoutExpired, VastError, OSError) as exc:
+        if snap is None:
             now = time.monotonic()
             if ssh_failure_started is None:
                 ssh_failure_started = now
@@ -169,14 +186,17 @@ def wait_for_job(
             logger.warning(
                 "Remote monitoring unavailable for {:.0f}s: {}",
                 disconnected_for,
-                exc,
+                snapshot_error or "Vast returned no SSH endpoint",
             )
             if disconnected_for >= args.ssh_reconnect_timeout:
                 raise VastError(
                     f"SSH did not recover within {args.ssh_reconnect_timeout}s"
-                ) from exc
+                ) from snapshot_error
             time.sleep(args.monitor_interval)
             continue
+        if ssh_failure_started is not None:
+            logger.success("SSH monitoring connection recovered")
+        ssh_failure_started = None
 
         if snap.stage != last_stage:
             logger.info("Remote stage -> {}", snap.stage)

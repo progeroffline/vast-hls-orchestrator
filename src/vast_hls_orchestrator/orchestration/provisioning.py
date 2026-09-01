@@ -13,6 +13,7 @@ from rich.markup import escape
 from ..core.console import console
 from ..core.constants import BAD_STATES, INSTANCE_ENV
 from ..core.errors import AmbiguousCreate, OfferUnavailable, VastAuthError, VastError
+from ..core.models import SshEndpoint
 from ..remote.ssh import wait_for_ssh
 from ..vast_api.client import VastClient
 
@@ -21,8 +22,51 @@ from ..vast_api.client import VastClient
 # after a reboot (before the container is even back to "running") before
 # polling SSH again.
 SSH_ATTEMPT_TIMEOUT_S = 180
+DIRECT_SSH_ATTEMPT_TIMEOUT_S = 45
 SSH_RECOVERY_ATTEMPTS = 3
 SSH_REBOOT_SETTLE_S = 15
+
+
+def direct_ssh_endpoint(info: dict) -> SshEndpoint | None:
+    """Return only the real direct route: public IP plus mapped container port 22."""
+    host = str(info.get("public_ipaddr") or "").strip()
+    ports = info.get("ports")
+    mappings = ports.get("22/tcp") if isinstance(ports, dict) else None
+    if not host or not isinstance(mappings, list) or not mappings:
+        return None
+    first = mappings[0]
+    if not isinstance(first, dict):
+        return None
+    try:
+        port = int(first.get("HostPort"))
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return SshEndpoint("direct", host, port)
+
+
+def proxy_ssh_endpoint(info: dict) -> SshEndpoint | None:
+    """Return Vast's relay route without combining it with direct-route fields."""
+    host = str(info.get("ssh_host") or "").strip()
+    try:
+        port = int(info.get("ssh_port"))
+    except (TypeError, ValueError):
+        return None
+    if not host or not 1 <= port <= 65535:
+        return None
+    return SshEndpoint("proxy", host, port)
+
+
+def ssh_endpoint_candidates(info: dict) -> list[SshEndpoint]:
+    """Available SSH routes in connection preference order: direct, then proxy."""
+    result: list[SshEndpoint] = []
+    for endpoint in (direct_ssh_endpoint(info), proxy_ssh_endpoint(info)):
+        if endpoint is not None and (endpoint.host, endpoint.port) not in {
+            (item.host, item.port) for item in result
+        }:
+            result.append(endpoint)
+    return result
 
 
 def read_public_key(ssh_key_path: Path) -> str | None:
@@ -62,7 +106,7 @@ def wait_for_running(client: VastClient, instance_id: int, timeout_s: int) -> di
             if state != last:
                 logger.info("Instance state: {}{}", state, f"; {msg}" if msg else "")
                 last = state
-            if state == "running" and info.get("ssh_host") and info.get("ssh_port"):
+            if state == "running" and ssh_endpoint_candidates(info):
                 return info
             if state in BAD_STATES:
                 raise VastError(f"Instance entered terminal/bad state: {state}")
@@ -86,10 +130,9 @@ def wait_for_ssh_with_recovery(
     args: argparse.Namespace,
     client: VastClient,
     instance_id: int,
-    host: str,
-    port: int,
+    info: dict,
 ) -> tuple[str, int]:
-    """Wait for SSH; if it never comes up, reboot the instance and retry.
+    """Try direct SSH first, then Vast proxy; reboot only if both routes fail.
 
     onstart rewrites /root/.ssh/authorized_keys from scratch on every
     container start (see remote/onstart.py), so a reboot is the reset used
@@ -101,27 +144,52 @@ def wait_for_ssh_with_recovery(
     """
     last_error: VastError | None = None
     for attempt in range(1, SSH_RECOVERY_ATTEMPTS + 1):
-        try:
-            wait_for_ssh(args, host, port, timeout_s=SSH_ATTEMPT_TIMEOUT_S)
-            return host, port
-        except VastError as exc:
-            last_error = exc
-            if attempt == SSH_RECOVERY_ATTEMPTS:
-                break
-            logger.warning(
-                "SSH not reachable after {}s (attempt {}/{}); rebooting instance {} "
-                "to reset authorized_keys and retrying",
-                SSH_ATTEMPT_TIMEOUT_S,
-                attempt,
-                SSH_RECOVERY_ATTEMPTS,
-                instance_id,
+        endpoints = ssh_endpoint_candidates(info)
+        for endpoint in endpoints:
+            timeout = (
+                DIRECT_SSH_ATTEMPT_TIMEOUT_S
+                if endpoint.kind == "direct" and len(endpoints) > 1
+                else SSH_ATTEMPT_TIMEOUT_S
             )
-            client.reboot_instance(instance_id)
-            info = wait_for_running(client, instance_id, args.boot_timeout)
-            host = str(info["ssh_host"])
-            port = int(info["ssh_port"])
-            _reset_known_hosts(args)
-            time.sleep(SSH_REBOOT_SETTLE_S)
+            logger.info(
+                "Trying {} SSH endpoint root@{}:{}",
+                endpoint.kind,
+                endpoint.host,
+                endpoint.port,
+            )
+            try:
+                wait_for_ssh(args, endpoint.host, endpoint.port, timeout_s=timeout)
+                logger.success(
+                    "Using {} SSH endpoint root@{}:{}",
+                    endpoint.kind,
+                    endpoint.host,
+                    endpoint.port,
+                )
+                return endpoint.host, endpoint.port
+            except VastError as exc:
+                last_error = exc
+                logger.warning(
+                    "{} SSH endpoint {}:{} is unavailable; {}",
+                    endpoint.kind.capitalize(),
+                    endpoint.host,
+                    endpoint.port,
+                    "trying fallback"
+                    if endpoint != endpoints[-1]
+                    else "no routes remain",
+                )
+        if attempt == SSH_RECOVERY_ATTEMPTS:
+            break
+        logger.warning(
+            "No SSH route reachable (attempt {}/{}); rebooting instance {} "
+            "to reset authorized_keys and retrying",
+            attempt,
+            SSH_RECOVERY_ATTEMPTS,
+            instance_id,
+        )
+        client.reboot_instance(instance_id)
+        info = wait_for_running(client, instance_id, args.boot_timeout)
+        _reset_known_hosts(args)
+        time.sleep(SSH_REBOOT_SETTLE_S)
     raise VastError(
         f"SSH never became reachable after {SSH_RECOVERY_ATTEMPTS} reboot-and-retry "
         f"cycles: {last_error}"

@@ -61,8 +61,8 @@ nohup bash -lc 'sleep {int(failsafe_seconds)}; if [ -z "${{CONTAINER_API_KEY:-}}
 echo "=== Bootstrap started $(date -u +%FT%TZ) ==="
 # ffmpeg (custom NVENC/NVDEC/scale_cuda build), aria2, curl and
 # ca-certificates are already baked into the vast-transcoder image; only
-# rsync is missing (needed on this side too -- the origin's `rsync pull`
-# spawns `rsync --server` over the same ssh connection on the remote end).
+# rsync is missing and is needed here as the client for direct result push
+# from this Vast instance to the origin.
 apt-get update -qq
 apt-get install -y --no-install-recommends rsync
 printf '%s' {payload!r} | base64 -d | gunzip > /workspace/encode-job.sh

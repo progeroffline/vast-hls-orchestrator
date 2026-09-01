@@ -6,6 +6,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class SshEndpoint:
+    """One Vast SSH route; direct and proxy fields must never be mixed."""
+
+    kind: str
+    host: str
+    port: int
+
+
 @dataclass
 class EncodeProgress:
     """Progress of the single ABR-encode FFmpeg process.

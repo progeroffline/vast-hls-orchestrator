@@ -24,6 +24,8 @@ def ssh_base(args: argparse.Namespace, host: str, port: int) -> list[str]:
         "-o",
         "IdentitiesOnly=yes",
         "-o",
+        "Compression=no",
+        "-o",
         "ConnectTimeout=10",
         "-o",
         "ServerAliveInterval=15",

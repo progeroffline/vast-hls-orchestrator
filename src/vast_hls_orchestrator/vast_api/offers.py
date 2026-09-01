@@ -82,7 +82,7 @@ def choose_offers(
             # Both required at a 500 Mbps floor by the search filters already;
             # among candidates that clear it, still prefer faster (1 Gbps+
             # is the stated preference) for both directions -- download feeds
-            # the encode, upload is what the origin's rsync pull draws from.
+            # the encode, upload carries the direct rsync push to origin.
             -float(o.get("inet_down") or 0),
             -float(o.get("inet_up") or 0),
             -float(o.get("disk_bw") or 0),
@@ -104,6 +104,7 @@ def choose_offers(
     table.add_column("Offer", justify="right")
     table.add_column("GPU")
     table.add_column("NVENC", justify="right")
+    table.add_column("Direct", justify="right")
     table.add_column("$/h", justify="right")
     table.add_column("Reliability", justify="right")
     table.add_column("Down Mbps", justify="right")
@@ -118,6 +119,7 @@ def choose_offers(
             str(offer.get("id", "-")),
             gpu_name,
             str(gpu_nvenc_sessions(gpu_name)),
+            "yes" if int(offer.get("direct_port_count") or 0) >= 1 else "no",
             f"{float(offer.get('dph_total') or 0):.4f}",
             f"{float(offer.get('reliability') or 0):.4f}",
             f"{float(offer.get('inet_down') or 0):.0f}",

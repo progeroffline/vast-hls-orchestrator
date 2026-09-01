@@ -164,12 +164,8 @@ def run(args: argparse.Namespace) -> int:
         rental_started_at = time.time()
 
         info = wait_for_running(client, instance_id, args.boot_timeout)
-        remote_host = str(info["ssh_host"])
-        remote_port = int(info["ssh_port"])
-        logger.info("SSH endpoint: root@{}:{}", remote_host, remote_port)
-
         remote_host, remote_port = wait_for_ssh_with_recovery(
-            args, client, instance_id, remote_host, remote_port
+            args, client, instance_id, info
         )
 
         # Pushed over the already-trusted admin SSH channel confirmed live

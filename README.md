@@ -123,7 +123,7 @@ src/vast_hls_orchestrator/
 
 - Приватная часть существует только на Binary Racks.
 - Публичная часть передаётся в `onstart` и пишется в `authorized_keys` контейнера напрямую (см. [SSH-ключ пишется в контейнер напрямую](#ssh-ключ-пишется-в-контейнер-напрямую-а-не-через-аккаунтную-инъекцию-vast)) — добавлять её в аккаунт Vast.ai заранее больше не обязательно для доступа, хотя это остаётся частью первоначальной настройки и не вредит.
-- Используется локальным `ssh`/`rsync` для входа `root@<vast-host>:<port>`.
+- Используется локальным `ssh` для control-plane доступа к Vast. Direct endpoint всегда собирается только как `public_ipaddr + ports["22/tcp"][0]["HostPort"]`; proxy endpoint — только как `ssh_host + ssh_port`. Поля этих двух маршрутов не смешиваются.
 - Временный Vast instance видит только соответствующий public key.
 - Для каждого job создаётся отдельный ephemeral `known_hosts`; это устраняет конфликты при повторном использовании Vast IP/port.
 
@@ -322,7 +322,7 @@ Offers сортируются лексикографически по следу
 5. максимальная upload bandwidth (`inet_up`) — тот же принцип: 500 Mbps гарантирован фильтром, из прошедших фильтр предпочитается более быстрый — именно через upload-канал instance пушит готовый ABR HLS напрямую на origin (см. [Upload: direct parallel push](#upload-direct-parallel-push-vast--origin));
 6. максимальная disk bandwidth.
 
-В terminal выводится таблица пяти лучших кандидатов с отдельной колонкой `NVENC`. Для аренды последовательно рассматриваются первые десять: если offer уже занят или вернул `no_compatible_tag`, берётся следующий — но только среди `RTX 4080`, без расширения на другую модель GPU (см. [Vast host/offer](#vast-hostoffer)).
+В terminal выводится таблица пяти лучших кандидатов с отдельными колонками `NVENC` и `Direct`. Поиск требует `direct_port_count >= 1`. Для аренды последовательно рассматриваются первые десять: если offer уже занят или вернул `no_compatible_tag`, берётся следующий — но только среди `RTX 4080`, без расширения на другую модель GPU.
 
 ## Создание Vast instance
 
@@ -374,12 +374,19 @@ mv -f /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys
 
 ### SSH-recovery: reboot instance, если SSH не поднялся
 
-Если после появления SSH endpoint (`wait_for_running`) вход по SSH не проходит в течение окна ожидания (`orchestration/provisioning.wait_for_ssh_with_recovery`), orchestrator не сдаётся сразу, а:
+Vast сообщает два независимых SSH-маршрута:
+
+- **direct**: `public_ipaddr` + `ports["22/tcp"][0]["HostPort"]`;
+- **proxy/relay**: `ssh_host` + `ssh_port`.
+
+Orchestrator сначала проверяет direct endpoint и только при его недоступности использует proxy. `ssh_port` никогда не соединяется с `public_ipaddr`. Во время monitoring сохраняется уже работающий маршрут; если он ломается, второй проверяется немедленно до начала общего reconnect timeout. SSH compression явно отключён, как и в bulk rsync.
+
+Если оба маршрута не проходят в течение окна ожидания (`orchestration/provisioning.wait_for_ssh_with_recovery`), orchestrator не сдаётся сразу, а:
 
 1. вызывает `PUT /api/v0/instances/reboot/<id>/` — стоп/старт того же контейнера без потери GPU-аренды (в отличие от destroy/re-rent);
 2. это заново прогоняет `onstart`, а значит и переписанный с нуля блок записи ключа выше — эффективно "убрать и заново добавить" сам ключ, без необходимости SSH-сессии, чтобы сделать это вручную;
 3. заново ждёт `actual_status=running` (`wait_for_running`), затем сбрасывает локальный `known_hosts` для этого job — свежий старт контейнера может пересоздать host key sshd, а `StrictHostKeyChecking=accept-new` доверяет только *новому* хосту и откажет, если для уже записанного хоста ключ поменялся;
-4. снова ждёт SSH какое-то время.
+4. снова проверяет direct, затем proxy.
 
 Цикл повторяется до нескольких раз подряд; если SSH так и не поднялся — job завершается ошибкой с диагностикой. Поскольку Vast reboot API не принимает параметров, каждый reboot заново гоняет тот же самый `onstart` — двух reboot подряд («убрать / перезапустить / добавить / перезапустить» как раздельные шаги) не требуется: перезапись ключа с нуля уже происходит атомарно при каждом отдельном reboot.
 
@@ -561,9 +568,11 @@ API keys и private key contents не логируются.
 
 ### Upload: direct parallel push (Vast → origin)
 
-Раньше bulk-транспорт (`.ts`-сегменты, playlists, master) шёл через `rsync pull`: origin сам подключался к Vast (через relay `sshN.vast.ai` или, при доступности, `public_ipaddr` instance'а) и забирал `/workspace/out/` одним потоком — по факту ≈3.5–4 MiB/s. Прямой outbound push с самого instance при 16 параллельных потоках даёт на порядок больше (замерено отдельно: ≈28 MiB/s / ≈226 Mbps на 16 потоках против ≈3.5 MiB/s на одном). Поэтому transfer теперь идёт в обратную сторону — remote job сам пушит результат на origin, и relay остаётся только под control-plane (мониторинг, SSH-recovery), где пропускная способность не критична.
+Раньше bulk-транспорт (`.ts`-сегменты, playlists, master) шёл через `rsync pull`: origin сам подключался к Vast через SSH endpoint и забирал `/workspace/out/` одним потоком — по факту ≈3.5–4 MiB/s, а через `sshN.vast.ai` relay мог падать до 2–3 MiB/s. Прямой outbound push с самого instance при 16 параллельных потоках даёт на порядок больше (замерено отдельно: ≈28 MiB/s / ≈226 Mbps на 16 потоках против ≈3.5 MiB/s на одном). Поэтому bulk transfer теперь идёт в обратную сторону — remote job сам пушит результат на публичный SSH Binary Racks. Vast direct/proxy endpoints используются только для control-plane; proxy является fallback, а не путём передачи HLS.
 
 После `finalizing` remote job (`remote/job_script.py`) переходит в `set_stage uploading` и делает следующее:
+
+Upload намеренно начинается после успешного завершения единого FFmpeg-процесса. Передача сегментов одновременно с encoding потребовала бы отдельного watcher-протокола, который достоверно отличает закрытый `.ts` от ещё записываемого и согласует четыре изменяющихся playlist; ошибка здесь способна опубликовать усечённый сегмент. Узкое место relay устранено direct push и параллельными workers без вмешательства в проверенный encoding lifecycle.
 
 1. Строит манифест всех `.ts` сегментов (`find "$OUT" -name 'segment_*.ts' -printf '%s %P\n'`) — размер + относительный путь (`1080p/segment_00000.ts` и т.п.).
 2. Балансирует их по **суммарному байтовому размеру**, не по количеству файлов и не по одному worker'у на rendition (у renditions сильно разный размер — naive-разбиение оставило бы 1080p как одинокий медленный поток, пока остальные уже закончили). Алгоритм — greedy LPT (largest-first в самый лёгкий на данный момент batch), реализован как отдельный чистый модуль `remote/upload_batching.py::plan_batches()`, embedded в generated bash буквально (единственный источник истины, покрыт юнит-тестами напрямую как Python).
@@ -716,7 +725,7 @@ uv run vast-hls-orchestrator --help
 - [FFmpeg](https://ffmpeg.org/documentation.html) — ffprobe, NVDEC, CUDA filters, NVENC и HLS muxer.
 - [FFmpeg progress protocol](https://ffmpeg.org/ffmpeg.html#toc-Advanced-options) — machine-readable `-progress`.
 - [aria2](https://aria2.github.io/) — parallel Range download.
-- [rsync](https://rsync.samba.org/documentation.html) — resumable result pull.
+- [rsync](https://rsync.samba.org/documentation.html) — параллельный resumable push результата с Vast на origin.
 - [OpenSSH](https://www.openssh.com/manual.html) — non-interactive remote monitoring and transport.
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/) — GPU exposure и driver capabilities на host side.
 
